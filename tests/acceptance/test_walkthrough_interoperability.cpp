@@ -262,9 +262,53 @@ int main(int argc, char* argv[]) {
     CHECK(bundle_dec["format"] == "av_spatial_bundle", "Bundle format must be av_spatial_bundle");
     CHECK(bundle_dec["schema_version"] == "1.1", "Bundle schema_version must be 1.1");
     CHECK(bundle_dec["nav_graph"] == "los_v1", "Bundle nav_graph must be los_v1");
+    CHECK(bundle_dec.contains("registration_metrics"), "Bundle must include registration_metrics");
     CHECK(bundle_dec["transform_to_project"].is_array() && bundle_dec["transform_to_project"].size() == 16,
           "Bundle transform_to_project must be a flat 16-float row-major array");
     CHECK(bundle_dec["floors"].size() == 2, "Bundle JSON must list 2 floors");
+
+    // Verify all standardized av-scanar + AV Structure files exist on baseline dataset
+    CHECK(fs::exists(res_dec.pointcloud_airy_ply_path) && fs::file_size(res_dec.pointcloud_airy_ply_path, ec) > 64,
+          "pointcloud_airy.ply must exist and be non-empty");
+    CHECK(fs::exists(res_dec.pointcloud_airy_pcd_path) && fs::file_size(res_dec.pointcloud_airy_pcd_path, ec) > 64,
+          "pointcloud_airy.pcd must exist and be non-empty");
+    CHECK(fs::exists(res_dec.pointcloud_stereo_ply_path) && fs::file_size(res_dec.pointcloud_stereo_ply_path, ec) > 64,
+          "pointcloud_stereo.ply must exist and be non-empty for RGB cloud");
+    CHECK(fs::exists(res_dec.pointcloud_stereo_pcd_path) && fs::file_size(res_dec.pointcloud_stereo_pcd_path, ec) > 64,
+          "pointcloud_stereo.pcd must exist and be non-empty for RGB cloud");
+    CHECK(fs::exists(res_dec.pointcloud_fused_rgb_ply_path) && fs::file_size(res_dec.pointcloud_fused_rgb_ply_path, ec) > 64,
+          "pointcloud_fused_rgb.ply must exist and be non-empty");
+    CHECK(fs::exists(res_dec.pointcloud_fused_rgb_pcd_path) && fs::file_size(res_dec.pointcloud_fused_rgb_pcd_path, ec) > 64,
+          "pointcloud_fused_rgb.pcd must exist and be non-empty");
+    CHECK(fs::exists(res_dec.trajectory_csv_path) && fs::file_size(res_dec.trajectory_csv_path, ec) > 32,
+          "trajectory.csv must exist and be non-empty");
+    CHECK(fs::exists(res_dec.trajectory_tum_path) && fs::file_size(res_dec.trajectory_tum_path, ec) > 32,
+          "trajectory_tum.txt must exist and be non-empty");
+    CHECK(fs::exists(dec_bundle_dir / "flash_anchors.json"), "flash_anchors.json must exist");
+    CHECK(fs::exists(res_dec.scan_metadata_path), "scan_metadata.json must exist");
+    CHECK(fs::exists(res_dec.stations_manifest_path), "stations_manifest.json must exist");
+
+    {
+        std::ifstream sm_ifs(res_dec.stations_manifest_path);
+        json st_manifest = json::parse(sm_ifs);
+        CHECK(st_manifest["schema"] == "ArtificialVision.AVStructure.StationsManifest.v1",
+              "stations_manifest.json schema must match ArtificialVision.AVStructure.StationsManifest.v1");
+        CHECK(st_manifest["stations"].size() == res_dec.station_count,
+              "stations_manifest.json station count must match exported station count");
+        for (const auto& st_entry : st_manifest["stations"]) {
+            const auto& files = st_entry["files"];
+            CHECK(fs::exists(dec_bundle_dir / files["panorama_rgb"].get<std::string>()),
+                  "Missing station panorama_rgb.jpg");
+            CHECK(fs::exists(dec_bundle_dir / files["depth_map_mm"].get<std::string>()),
+                  "Missing station depth_map_mm.png");
+            CHECK(fs::exists(dec_bundle_dir / files["coverage_mask"].get<std::string>()),
+                  "Missing station coverage_mask.png");
+            CHECK(fs::exists(dec_bundle_dir / files["provenance_code"].get<std::string>()),
+                  "Missing station provenance_code.png");
+            CHECK(fs::exists(dec_bundle_dir / files["structured_scan_ply"].get<std::string>()),
+                  "Missing station structured_scan.ply");
+        }
+    }
 
     for (const auto& fl : bundle_dec["floors"]) {
         CHECK(fl.contains("floor_elevation"), "Floor metadata must include floor_elevation");
@@ -421,9 +465,124 @@ int main(int argc, char* argv[]) {
     CHECK(bridge.flashAnchorCount() == 1, "QmlBridge flashAnchorCount should increment to 1");
     bridge.clearFlashStationAnchors();
     CHECK(bridge.flashAnchorCount() == 0, "QmlBridge clearFlashStationAnchors should reset to 0");
+    std::cout << "  [PASS] Gate 3: PointCloudProcessor & QmlBridge APIs verified.\n";
+
+    // =========================================================================
+    // GATE 4: LiDAR-Only (No RGB) Point Cloud & Black-and-White Panorama Parity
+    // =========================================================================
+    std::cout << "\n[GATE 4] Verifying LiDAR-Only (No RGB) Standardized Outputs & B&W Panoramas...\n";
+    std::vector<PointXYZI> cloud_lidar_only = cloud_dec;
+    for (size_t i = 0; i < cloud_lidar_only.size(); ++i) {
+        auto& pt = cloud_lidar_only[i];
+        pt.has_color = false;
+        pt.r = 255;
+        pt.g = 255;
+        pt.b = 255;
+        // Vary LiDAR reflectivity/intensity realistically across geometry
+        pt.intensity = static_cast<float>(0.20 + 0.75 * (0.5 + 0.5 * std::sin(pt.x * 0.9 + pt.y * 0.7 + pt.z * 1.1)));
+    }
+
+    const fs::path lidar_bundle_dir = sandbox / "bundle_lidar_only";
+    WalkthroughExportConfig cfg_lidar = cfg_dec;
+    cfg_lidar.scan_date = "2027-06-01";
+    cfg_lidar.scan_id = "scan_lidar_bw";
+    cfg_lidar.av_showcase_project_dir = (sandbox / "AV_Showcase_LiDAR_Only").string();
+
+    auto res_lidar = StructuredWalkthroughExporter::exportWalkthroughBundle(
+        lidar_bundle_dir.string(), cloud_lidar_only, traj_dec, flash_dec, {}, cfg_lidar, nullptr);
+
+    CHECK(res_lidar.success, "LiDAR-only walkthrough bundle export failed: " + res_lidar.error_message);
+    CHECK(res_lidar.is_monochrome_lidar_only, "LiDAR-only export must set is_monochrome_lidar_only = true");
+
+    // Verify all standardized av-scanar files exist for LiDAR-only scan
+    CHECK(fs::exists(res_lidar.pointcloud_airy_ply_path), "LiDAR-only pointcloud_airy.ply must exist");
+    CHECK(fs::exists(res_lidar.pointcloud_airy_pcd_path), "LiDAR-only pointcloud_airy.pcd must exist");
+    CHECK(fs::exists(res_lidar.pointcloud_stereo_ply_path), "LiDAR-only pointcloud_stereo.ply must exist (0-point header)");
+    CHECK(fs::exists(res_lidar.pointcloud_stereo_pcd_path), "LiDAR-only pointcloud_stereo.pcd must exist (0-point header)");
+    CHECK(fs::exists(res_lidar.pointcloud_fused_rgb_ply_path), "LiDAR-only pointcloud_fused_rgb.ply must exist");
+    CHECK(fs::exists(res_lidar.pointcloud_fused_rgb_pcd_path), "LiDAR-only pointcloud_fused_rgb.pcd must exist");
+    CHECK(fs::exists(res_lidar.scan_metadata_path), "LiDAR-only scan_metadata.json must exist");
+    CHECK(fs::exists(res_lidar.stations_manifest_path), "LiDAR-only stations_manifest.json must exist");
+
+    {
+        std::ifstream sm_ifs(res_lidar.scan_metadata_path);
+        json sm_lidar = json::parse(sm_ifs);
+        CHECK(sm_lidar["is_monochrome_lidar_only"].get<bool>() == true,
+              "scan_metadata.json must record is_monochrome_lidar_only = true");
+        CHECK(sm_lidar["airy_points"].get<size_t>() == cloud_lidar_only.size(),
+              "scan_metadata.json airy_points must match LiDAR point count");
+        CHECK(sm_lidar["stereo_points"].get<size_t>() == 0,
+              "scan_metadata.json stereo_points must be 0 for LiDAR-only scan");
+        CHECK(sm_lidar["fused_points"].get<size_t>() == cloud_lidar_only.size(),
+              "scan_metadata.json fused_points must match LiDAR point count");
+    }
+
+    {
+        std::ifstream lb_ifs(res_lidar.bundle_json_path);
+        json bundle_lidar = json::parse(lb_ifs);
+        for (const auto& p : bundle_lidar["panos"]) {
+            CHECK(p["provenance"] == "GEOMETRY_UNCOLORED",
+                  "LiDAR-only panorama provenance must be GEOMETRY_UNCOLORED, got " + p["provenance"].get<std::string>());
+            fs::path pano_jpg = lidar_bundle_dir / p["image_path"].get<std::string>();
+            std::vector<uint8_t> rgb_px;
+            int pw = 0, ph = 0;
+            CHECK(StructuredWalkthroughExporter::decodeJpegFileRgb(pano_jpg.string(), rgb_px, pw, ph),
+                  "Failed to decode LiDAR-only panorama JPEG: " + pano_jpg.string());
+            CHECK(pw == cfg_lidar.pano_width && ph == cfg_lidar.pano_height,
+                  "Decoded LiDAR-only panorama dimensions mismatch");
+
+            size_t nonzero_bw_px = 0;
+            size_t zero_black_px = 0;
+            std::set<uint8_t> distinct_grays;
+            const size_t total_px = static_cast<size_t>(pw) * static_cast<size_t>(ph);
+            for (size_t i = 0; i < total_px; ++i) {
+                uint8_t r = rgb_px[i * 3 + 0];
+                uint8_t g = rgb_px[i * 3 + 1];
+                uint8_t b = rgb_px[i * 3 + 2];
+                CHECK(r == g && g == b,
+                      "LiDAR-only panorama pixel must be strictly Black-and-White (R == G == B)!");
+                if (r > 0) {
+                    ++nonzero_bw_px;
+                    distinct_grays.insert(r);
+                } else {
+                    ++zero_black_px;
+                }
+            }
+            CHECK(nonzero_bw_px > total_px / 10,
+                  "LiDAR-only B&W panorama must contain observed grayscale geometry pixels");
+            CHECK(zero_black_px > 0,
+                  "LiDAR-only B&W panorama must preserve pure black (0,0,0) for unobserved angles");
+            CHECK(distinct_grays.size() >= 12,
+                  "LiDAR-only B&W panorama must have rich grayscale shading variation, got " +
+                  std::to_string(distinct_grays.size()) + " levels");
+        }
+    }
+
+    // Verify pointcloud_fused_rgb.pcd and cache/lod0.bin are also strictly Black-and-White (R == G == B) with grayscale shading
+    {
+        std::vector<PointXYZI> lidar_lod0;
+        CHECK(StructuredWalkthroughExporter::readLod0Bin(res_lidar.lod0_bin_path, lidar_lod0),
+              "Failed to read LiDAR-only lod0.bin");
+        std::set<uint8_t> lod0_grays;
+        for (const auto& pt : lidar_lod0) {
+            CHECK(pt.r == pt.g && pt.g == pt.b, "LiDAR-only lod0.bin point must have R == G == B");
+            lod0_grays.insert(pt.r);
+        }
+        CHECK(lod0_grays.size() >= 10, "LiDAR-only lod0.bin must have grayscale intensity/elevation shading variation");
+
+        std::vector<PointXYZI> lidar_fused_pcd;
+        CHECK(PointCloudProcessor::loadPcd(res_lidar.pointcloud_fused_rgb_pcd_path, lidar_fused_pcd),
+              "Failed to load LiDAR-only pointcloud_fused_rgb.pcd");
+        CHECK(lidar_fused_pcd.size() == cloud_lidar_only.size(),
+              "LiDAR-only pointcloud_fused_rgb.pcd point count mismatch");
+        for (const auto& pt : lidar_fused_pcd) {
+            CHECK(pt.r == pt.g && pt.g == pt.b,
+                  "LiDAR-only pointcloud_fused_rgb.pcd point must have R == G == B");
+        }
+    }
+    std::cout << "  [PASS] Gate 4: LiDAR-only standardized outputs & strictly B&W (R=G=B) panoramas/clouds verified.\n";
 
     fs::remove_all(sandbox, ec);
-    std::cout << "  [PASS] Gate 3: PointCloudProcessor & QmlBridge APIs verified.\n";
     std::cout << "\n=====================================================================\n"
               << "  ALL ECOSYSTEM WALKTHROUGH INTEROPERABILITY GATES PASSED (100%)     \n"
               << "=====================================================================\n";

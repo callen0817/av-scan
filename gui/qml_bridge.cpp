@@ -2374,17 +2374,37 @@ bool QmlBridge::saveCapture() {
             }
         }
 
-        if (canonical_cloud && canonical_cloud->size() >= 10) {
+        if (canonical_cloud && !canonical_cloud->empty()) {
+            const std::vector<core::schemas::PointXYZI>* airy_src = nullptr;
+            const std::vector<core::schemas::PointXYZI>* stereo_src = nullptr;
+            for (const auto& s : activeSensors_) {
+                if (s.id == "AIRY" && !s.map_points.empty()) {
+                    airy_src = &s.map_points;
+                } else if ((s.id == "GEMINI" || s.id == "VITURE" || s.id == "CAMERA") &&
+                           !s.map_points.empty() && !stereo_src) {
+                    stereo_src = &s.map_points;
+                }
+            }
+            if (!airy_src && !airyMapPoints_.empty()) airy_src = &airyMapPoints_;
+            if (!airy_src) airy_src = canonical_cloud;
+            if (!stereo_src && !geminiMapPoints_.empty()) stereo_src = &geminiMapPoints_;
+            if (!stereo_src && !vitureMapPoints_.empty()) stereo_src = &vitureMapPoints_;
+            if (!stereo_src && !cameraMapPoints_.empty()) stereo_src = &cameraMapPoints_;
+
             core::processing::WalkthroughExportConfig wcfg;
             wcfg.project_id = projectId_.toStdString();
             wcfg.project_name = projectName_.isEmpty() ? projectId_.toStdString() : projectName_.toStdString();
             wcfg.scan_id = currentSessionId_.toStdString();
             wcfg.scan_date = QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd").toStdString();
+            wcfg.capture_duration_seconds = static_cast<double>(elapsed_seconds_);
+            wcfg.airy_points = airy_src;
+            wcfg.stereo_points = stereo_src;
             fs::path proj_dir = fs::path(storage_->getRootDirectory()) / "projects" / projectId_.toStdString();
             wcfg.av_showcase_project_dir = (proj_dir / "av_showcase").string();
 
+            // Export standardized av-scanar + AV Structure + AV Showcase files directly into sess_dir
             auto wres = core::processing::StructuredWalkthroughExporter::exportWalkthroughBundle(
-                (sess_dir / "walkthrough_bundle").string(),
+                sess_dir.string(),
                 *canonical_cloud,
                 canonical_traj ? *canonical_traj : std::vector<core::schemas::Pose3D>{},
                 flashAnchors_,
@@ -5218,6 +5238,11 @@ QString QmlBridge::exportActivePointCloud(const QString& formatStr,
             ? ("export_" + std::to_string(QDateTime::currentSecsSinceEpoch()))
             : currentSessionId_.toStdString();
         wcfg.scan_date = QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd").toStdString();
+        wcfg.capture_duration_seconds = static_cast<double>(elapsed_seconds_);
+        if (!airyMapPoints_.empty()) wcfg.airy_points = &airyMapPoints_;
+        if (!geminiMapPoints_.empty()) wcfg.stereo_points = &geminiMapPoints_;
+        else if (!vitureMapPoints_.empty()) wcfg.stereo_points = &vitureMapPoints_;
+        else if (!cameraMapPoints_.empty()) wcfg.stereo_points = &cameraMapPoints_;
         if (fmt == core::processing::ExportFormat::AV_WALKTHROUGH_BUNDLE) {
             wcfg.av_showcase_project_dir = (base_dir / "projects" / pid / "av_showcase").string();
         }

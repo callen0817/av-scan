@@ -791,6 +791,7 @@ std::vector<DeviceProfiler::DiscoveredPhysicalDevice> DeviceProfiler::discoverPh
 
         // Check for existing profile on disk
         std::string existing_id;
+        fs::path matched_path;
         bool found = false;
         std::vector<fs::path> prof_dirs = {
             repo_root / "profiles" / "experimental",
@@ -817,6 +818,7 @@ std::vector<DeviceProfiler::DiscoveredPhysicalDevice> DeviceProfiler::discoverPh
                     if (!p_id.empty() && (p_id == dev.device_id || (!dev.serial_number.empty() && dev.serial_number != "N/A" && p_id.find(dev.serial_number) != std::string::npos))) {
                         found = true;
                         existing_id = p_id;
+                        matched_path = entry.path();
                         break;
                     }
 
@@ -824,6 +826,7 @@ std::vector<DeviceProfiler::DiscoveredPhysicalDevice> DeviceProfiler::discoverPh
                     if (!dev.serial_number.empty() && dev.serial_number != "N/A" && !p_serial.empty() && p_serial == dev.serial_number) {
                         found = true;
                         existing_id = p_id;
+                        matched_path = entry.path();
                         break;
                     }
 
@@ -837,7 +840,26 @@ std::vector<DeviceProfiler::DiscoveredPhysicalDevice> DeviceProfiler::discoverPh
                         }
                         found = true;
                         existing_id = p_id;
+                        matched_path = entry.path();
                         break;
+                    }
+
+                    // Model name match (e.g. "Gemini 336L", "Luma Ultra", "RS-Airy")
+                    std::string p_model = j.value("model", "");
+                    if (!p_model.empty() && p_model.size() >= 4) {
+                        std::string lower_model = p_model;
+                        std::string lower_prod = dev.product_name;
+                        std::string lower_disp = dev.display_name;
+                        std::transform(lower_model.begin(), lower_model.end(), lower_model.begin(), ::tolower);
+                        std::transform(lower_prod.begin(), lower_prod.end(), lower_prod.begin(), ::tolower);
+                        std::transform(lower_disp.begin(), lower_disp.end(), lower_disp.begin(), ::tolower);
+                        if (lower_prod.find(lower_model) != std::string::npos ||
+                            lower_disp.find(lower_model) != std::string::npos) {
+                            found = true;
+                            existing_id = p_id;
+                            matched_path = entry.path();
+                            break;
+                        }
                     }
                 } catch (...) {}
             }
@@ -847,24 +869,20 @@ std::vector<DeviceProfiler::DiscoveredPhysicalDevice> DeviceProfiler::discoverPh
         if (found) {
             dev.profile_status = "PROFILED";
             dev.existing_profile_id = existing_id;
-            for (const auto& dir : prof_dirs) {
-                fs::path ppath = dir / (existing_id + ".json");
-                if (fs::exists(ppath)) {
-                    try {
-                        std::ifstream pf(ppath);
-                        nlohmann::json pj;
-                        pf >> pj;
-                        if (pj.contains("slam_family")) {
-                            std::string sf = pj["slam_family"].get<std::string>();
-                            if (!sf.empty()) dev.compatible_reconstruction = sf;
-                        }
-                        if (pj.contains("slam_backend")) {
-                            std::string sb = pj["slam_backend"].get<std::string>();
-                            dev.recommended_backend = sb.empty() ? "NONE" : sb;
-                        }
-                    } catch (...) {}
-                    break;
-                }
+            if (!matched_path.empty() && fs::exists(matched_path)) {
+                try {
+                    std::ifstream pf(matched_path);
+                    nlohmann::json pj;
+                    pf >> pj;
+                    if (pj.contains("slam_family")) {
+                        std::string sf = pj["slam_family"].get<std::string>();
+                        if (!sf.empty()) dev.compatible_reconstruction = sf;
+                    }
+                    if (pj.contains("slam_backend")) {
+                        std::string sb = pj["slam_backend"].get<std::string>();
+                        dev.recommended_backend = sb.empty() ? "NONE" : sb;
+                    }
+                } catch (...) {}
             }
         } else {
             // FUNDAMENTAL ARCHITECTURE RULE: Discovery precedes profiling.

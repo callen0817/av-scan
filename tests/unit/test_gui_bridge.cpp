@@ -283,6 +283,16 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "    Ecosystem catalog & template profile generation verified." << std::endl;
 
+    // 9. Live Hardware Auto-Detect & Manual Override Mode
+    std::cout << "  Testing Live Hardware Auto-Detect & Manual Override Mode..." << std::endl;
+    assert(bridge->autoDetectHardware() == true);
+    bridge->selectScannerManual(0);
+    assert(bridge->autoDetectHardware() == false);
+    assert(bridge->autoDetectSummary().startsWith("Manual Override:"));
+    bridge->triggerAutoDetectNow();
+    assert(bridge->autoDetectHardware() == true);
+    std::cout << "    Live Hardware Auto-Detect & Manual Override verified." << std::endl;
+
     // Clean up
     fs::remove_all(test_dir);
     std::cout << ">>> All GUI Bridge Unit Tests PASSED <<<" << std::endl;

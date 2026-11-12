@@ -51,6 +51,7 @@ struct WalkthroughExportConfig {
     int pano_height{1024};
     int jpeg_quality{90};
     bool export_e57{true};
+    bool export_standardized_clouds{true};
     bool enable_small_gap_fill{true};
     bool enforce_gravity_z_up{false};
     std::string project_id;
@@ -58,6 +59,11 @@ struct WalkthroughExportConfig {
     std::string scan_date;
     std::string scan_id;
     std::string av_showcase_project_dir;
+    double capture_duration_seconds{0.0};
+    size_t cslam_peers_count{0};
+    const std::vector<schemas::PointXYZI>* airy_points{nullptr};
+    const std::vector<schemas::PointXYZI>* stereo_points{nullptr};
+    const std::vector<schemas::PointXYZI>* cslam_merged_points{nullptr};
 };
 
 struct E57ValidationSummary {
@@ -75,13 +81,24 @@ struct WalkthroughBundleResult {
     bool success{false};
     std::string bundle_dir;
     std::string bundle_json_path;
+    std::string stations_manifest_path;
+    std::string scan_metadata_path;
     std::string structured_e57_path;
     std::string lod0_bin_path;
     std::string avproj_path;
+    std::string pointcloud_airy_ply_path;
+    std::string pointcloud_airy_pcd_path;
+    std::string pointcloud_stereo_ply_path;
+    std::string pointcloud_stereo_pcd_path;
+    std::string pointcloud_fused_rgb_ply_path;
+    std::string pointcloud_fused_rgb_pcd_path;
+    std::string trajectory_csv_path;
+    std::string trajectory_tum_path;
     size_t station_count{0};
     size_t floor_count{0};
     size_t lod0_points_written{0};
     uint64_t e57_size_bytes{0};
+    bool is_monochrome_lidar_only{false};
     double registration_rmse_m{0.0};
     double registration_overlap{1.0};
     double export_time_ms{0.0};
@@ -94,6 +111,24 @@ public:
      * Computes Castagnoli CRC-32C (reflected polynomial 0x82F63B78) per ASTM E2807-11.
      */
     static uint32_t computeCrc32c(const uint8_t* data, size_t length);
+
+    /**
+     * Decodes a JPEG file into an 8-bit RGB buffer (width * height * 3).
+     */
+    static bool decodeJpegFileRgb(
+        const std::string& jpeg_path,
+        std::vector<uint8_t>& out_rgb,
+        int& out_width,
+        int& out_height);
+
+    /**
+     * Computes true Black-and-White (R = G = B) grayscale colors for uncolored / LiDAR-only
+     * points using LiDAR reflectivity/intensity and elevation shading.
+     * Returns true if the cloud is monochrome (no true RGB colors present).
+     */
+    static bool populateMonochromeGrayscaleForUncoloredPoints(
+        std::vector<schemas::PointXYZI>& points,
+        std::vector<bool>* out_point_has_true_rgb = nullptr);
 
     /**
      * Validates an ASTM E2807-11 Structured E57 file:
