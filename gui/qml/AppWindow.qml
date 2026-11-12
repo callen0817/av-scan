@@ -34,27 +34,275 @@ ApplicationWindow {
     property bool showSplashScreen: !skipSplashOnStartup
     property int rightDeckTab: 0
 
+    // Workspace Page State (matches scanarMini workspace_stack: Page 0 = Projects & Datasets Hub, Page 1 = Capture Studio)
+    property bool inCaptureStudio: false
+    property string hubSelectedProjectName: (bridge.projectName !== "" && bridge.projectName !== "No Active Project" && bridge.projectName !== "No Project Loaded") ? bridge.projectName : "Default_Project"
+    property string hubSelectedProjectId: bridge.projectId
+    readonly property string hubActiveProjectDisplay: (bridge.projectName !== "" && bridge.projectName !== "No Active Project" && bridge.projectName !== "No Project Loaded") ? bridge.projectName : (hubSelectedProjectName !== "" ? hubSelectedProjectName : "Default_Project")
+    property string activeDatasetName: "Dataset_" + Qt.formatDateTime(new Date(), "MMdd_HHmm")
+    property int selectedHubDatasetIndex: 0
+    property int selectedHubCslamIndex: 0
+    property int hubRevision: 0
+
+    // In-session projects & datasets registry (mirrors scanarMini self.projects_data while syncing with C++ StorageEngine)
+    property var hubCustomProjects: [
+        {
+            "id": "",
+            "name": "Default_Project",
+            "date": Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm"),
+            "description": "Default AV Scan Spatial Capture Project"
+        }
+    ]
+    property var hubDatasetsByProject: ({
+        "Default_Project": [
+            {
+                "name": "Dataset_" + Qt.formatDateTime(new Date(), "MMdd_HHmm"),
+                "created": Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss"),
+                "points": 0,
+                "saved": false,
+                "captureId": ""
+            }
+        ]
+    })
+
+    function getHubProjectsList() {
+        var rev = root.hubRevision;
+        var list = [];
+        var seenNames = {};
+        var dbProjs = bridge.projectList || [];
+        for (var i = 0; i < dbProjs.length; ++i) {
+            var p = dbProjs[i];
+            var pName = p.name || ("Project_" + (i + 1));
+            var pId = p.id || "";
+            seenNames[pName] = true;
+            var dsList = getHubDatasetsListFor(pName, pId);
+            list.push({
+                "id": pId,
+                "name": pName,
+                "date": p.date || "Active",
+                "description": p.description || "",
+                "datasetCount": dsList.length
+            });
+        }
+        for (var j = 0; j < root.hubCustomProjects.length; ++j) {
+            var cp = root.hubCustomProjects[j];
+            if (!seenNames[cp.name] && (dbProjs.length === 0 || cp.name !== "Default_Project")) {
+                var cds = getHubDatasetsListFor(cp.name, cp.id || "");
+                list.push({
+                    "id": cp.id || "",
+                    "name": cp.name,
+                    "date": cp.date || Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm"),
+                    "description": cp.description || "",
+                    "datasetCount": cds.length
+                });
+            }
+        }
+        return list;
+    }
+
+    function getHubDatasetsListFor(projName, projId) {
+        var rev = root.hubRevision;
+        var pName = projName || root.hubActiveProjectDisplay || "Default_Project";
+        var pId = projId !== undefined ? projId : root.hubSelectedProjectId;
+        var result = [];
+        var seenDs = {};
+
+        if (pId && pId !== "") {
+            var clouds = bridge.getProjectClouds(pId) || [];
+            for (var i = 0; i < clouds.length; ++i) {
+                var c = clouds[i];
+                var dName = c.capture_id || c.name || ("Dataset_" + (i + 1));
+                seenDs[dName] = true;
+                result.push({
+                    "name": dName,
+                    "created": "Saved on Disk",
+                    "points": c.point_count || 0,
+                    "saved": true,
+                    "captureId": c.capture_id || ""
+                });
+            }
+        }
+
+        var mapObj = root.hubDatasetsByProject || {};
+        var memList = mapObj[pName] || [];
+        for (var j = 0; j < memList.length; ++j) {
+            var m = memList[j];
+            if (!seenDs[m.name]) {
+                seenDs[m.name] = true;
+                result.push({
+                    "name": m.name,
+                    "created": m.created || Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss"),
+                    "points": m.points || 0,
+                    "saved": !!m.saved,
+                    "captureId": m.captureId || ""
+                });
+            }
+        }
+
+        if (result.length === 0) {
+            result.push({
+                "name": root.activeDatasetName || ("Dataset_" + Qt.formatDateTime(new Date(), "MMdd_HHmm")),
+                "created": Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss"),
+                "points": bridge.pointsCaptured || 0,
+                "saved": (bridge.pointsCaptured || 0) > 0,
+                "captureId": ""
+            });
+        }
+        return result;
+    }
+
+    function selectHubProject(projItem) {
+        if (!projItem) return;
+        root.hubSelectedProjectName = projItem.name;
+        root.hubSelectedProjectId = projItem.id || "";
+        if (projItem.id && projItem.id !== "") {
+            bridge.openProject(projItem.id);
+        }
+        var dsList = getHubDatasetsListFor(projItem.name, projItem.id || "");
+        if (dsList.length > 0) {
+            root.selectedHubDatasetIndex = dsList.length - 1;
+            root.activeDatasetName = dsList[root.selectedHubDatasetIndex].name;
+        }
+        root.hubRevision += 1;
+    }
+
+    function createNewProjectFromHub(rawName) {
+        var clean = (rawName || "").trim().replace(/\s+/g, "_");
+        if (clean === "") {
+            clean = "Project_" + Qt.formatDateTime(new Date(), "MMdd_HHmm");
+        }
+        var ok = bridge.createProject(clean, "Created from AV Scan Projects & C-SLAM Hub");
+        var newDsName = "Dataset_" + Qt.formatDateTime(new Date(), "MMdd_HHmm");
+        var mapObj = root.hubDatasetsByProject || {};
+        mapObj[clean] = [
+            {
+                "name": newDsName,
+                "created": Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss"),
+                "points": 0,
+                "saved": false,
+                "captureId": ""
+            }
+        ];
+        root.hubDatasetsByProject = mapObj;
+        root.hubSelectedProjectName = clean;
+        root.hubSelectedProjectId = bridge.projectId;
+        root.activeDatasetName = newDsName;
+        root.selectedHubDatasetIndex = 0;
+        root.hubRevision += 1;
+        return ok;
+    }
+
+    function createNewDatasetFromHub(rawDsName) {
+        var clean = (rawDsName || "").trim().replace(/\s+/g, "_");
+        if (clean === "") {
+            clean = "Dataset_" + Qt.formatDateTime(new Date(), "MMdd_HHmmss");
+        }
+        var pName = root.hubActiveProjectDisplay || "Default_Project";
+        var mapObj = root.hubDatasetsByProject || {};
+        var list = mapObj[pName] ? mapObj[pName].slice() : [];
+        var existsIdx = -1;
+        for (var i = 0; i < list.length; ++i) {
+            if (list[i].name === clean) {
+                existsIdx = i;
+                break;
+            }
+        }
+        if (existsIdx === -1) {
+            list.push({
+                "name": clean,
+                "created": Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss"),
+                "points": 0,
+                "saved": false,
+                "captureId": ""
+            });
+            mapObj[pName] = list;
+            root.hubDatasetsByProject = mapObj;
+        }
+        root.activeDatasetName = clean;
+        var allDs = getHubDatasetsListFor(pName, root.hubSelectedProjectId);
+        root.selectedHubDatasetIndex = Math.max(0, allDs.length - 1);
+        root.hubRevision += 1;
+    }
+
+    function ensureActiveProjectOpen() {
+        if (bridge.projectId !== "") {
+            return true;
+        }
+        var dbProjs = bridge.projectList || [];
+        if (dbProjs.length > 0) {
+            var targetId = dbProjs[0].id;
+            for (var i = 0; i < dbProjs.length; ++i) {
+                if (dbProjs[i].name === root.hubSelectedProjectName) {
+                    targetId = dbProjs[i].id;
+                    break;
+                }
+            }
+            bridge.openProject(targetId);
+            root.hubSelectedProjectId = bridge.projectId;
+            root.hubSelectedProjectName = bridge.projectName;
+            root.hubRevision += 1;
+            return true;
+        }
+        return createNewProjectFromHub(root.hubSelectedProjectName || "Default_Project");
+    }
+
+    function enterCaptureStudio(autoStartScan) {
+        ensureActiveProjectOpen();
+        root.inCaptureStudio = true;
+        if (autoStartScan && !bridge.isCapturing) {
+            bridge.startCapture();
+        }
+    }
+
+    function joinActiveCslamCapture() {
+        ensureActiveProjectOpen();
+        if (bridge.cslamScannerCount <= 1 && (bridge.discoveredNodes || []).length === 0) {
+            bridge.addSimulatedCslamScanner("Peer_Rig_Alpha", false);
+        }
+        var joinDs = "CSLAM_Join_" + Qt.formatDateTime(new Date(), "HHmmss");
+        createNewDatasetFromHub(joinDs);
+        root.rightDeckTab = 1;
+        root.inCaptureStudio = true;
+        if (!bridge.isCapturing) {
+            bridge.startCapture();
+        }
+    }
+
     Component.onCompleted: {
-        bridge.refreshDiscovery();
         for (var i = 0; i < Qt.application.arguments.length; ++i) {
-            if (Qt.application.arguments[i] === "--open-catalog") {
+            var arg = Qt.application.arguments[i];
+            if (arg === "--open-catalog") {
                 root.skipSplashOnStartup = true;
                 configureSensorsDialog.currentTab = 2;
                 configureSensorsDialog.open();
-                break;
-            } else if (Qt.application.arguments[i] === "--open-config") {
+            } else if (arg === "--open-config") {
                 root.skipSplashOnStartup = true;
                 configureSensorsDialog.currentTab = 1;
                 configureSensorsDialog.open();
-                break;
-            } else if (Qt.application.arguments[i] === "--open-diag") {
+            } else if (arg === "--open-diag") {
                 root.skipSplashOnStartup = true;
                 bridge.openOrientationDiagnostic();
                 orientationDiagDialog.open();
-                break;
-            } else if (Qt.application.arguments[i] === "--no-splash") {
+            } else if (arg === "--no-splash" || arg === "--test-mode") {
                 root.skipSplashOnStartup = true;
+            } else if (arg === "--capture-studio") {
+                root.skipSplashOnStartup = true;
+                root.inCaptureStudio = true;
             }
+        }
+        bridge.refreshDiscovery();
+        var dbProjs = bridge.projectList || [];
+        if (dbProjs.length > 0 && root.hubSelectedProjectId === "") {
+            root.hubSelectedProjectName = dbProjs[0].name;
+            root.hubSelectedProjectId = dbProjs[0].id;
+            var initDs = root.getHubDatasetsListFor(dbProjs[0].name, dbProjs[0].id);
+            if (initDs.length > 0) {
+                root.selectedHubDatasetIndex = 0;
+                root.activeDatasetName = initDs[0].name;
+            }
+        }
+        if (!root.showSplashScreen && bridge.hasPendingUnprofiledPrompt) {
+            unprofiledSensorConfirmDialog.openWithDevice(bridge.pendingUnprofiledDevice);
         }
     }
 
@@ -178,9 +426,9 @@ ApplicationWindow {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 12
-                anchors.rightMargin: 12
-                spacing: 10
+                anchors.leftMargin: 10
+                anchors.rightMargin: 10
+                spacing: 6
 
                 // 36x36 Circular Artificial Vision Emblem Badge (clicks re-open Splash Screen)
                 Rectangle {
@@ -232,7 +480,7 @@ ApplicationWindow {
                 // Brand Pill ("VERIFY · DIRECT · CLARIFY")
                 Rectangle {
                     height: 22
-                    width: brandPillText.implicitWidth + 20
+                    width: brandPillText.implicitWidth + 14
                     radius: 10
                     color: "#24BAA164" // rgba(186, 161, 100, 0.14)
                     border.color: "#7ABAA164" // rgba(186, 161, 100, 0.48)
@@ -243,36 +491,63 @@ ApplicationWindow {
                         anchors.centerIn: parent
                         text: "VERIFY · DIRECT · CLARIFY"
                         color: root.avGoldBright
-                        font.pixelSize: 10
+                        font.pixelSize: 9
                         font.bold: true
-                        font.letterSpacing: 1.3
+                        font.letterSpacing: 1.0
                     }
                 }
 
-                // Active Project Pill + New / Open Project Buttons (Retained AV Scan Feature)
+                // Active Project & Dataset Pill + Hub Toggle + New / Open Project Buttons
                 Rectangle {
-                    property bool hasProj: bridge.projectName !== "" && bridge.projectName !== "No Active Project"
+                    property bool hasProj: root.hubActiveProjectDisplay !== ""
                     height: 26
-                    width: projRow.implicitWidth + 16
+                    width: projRow.implicitWidth + 14
                     radius: 11
                     color: "#12FFFFFF"
-                    border.color: hasProj ? "#7ABAA164" : "#3DFFFFFF"
+                    border.color: "#7ABAA164"
                     border.width: 1
 
                     RowLayout {
                         id: projRow
                         anchors.centerIn: parent
-                        spacing: 6
+                        spacing: 5
+
+                        Button {
+                            id: headerHubToggleBtn
+                            text: root.inCaptureStudio ? "← PROJECTS HUB" : "🎥 CAPTURE STUDIO"
+                            implicitHeight: 20
+                            implicitWidth: headerHubToggleBtnText.implicitWidth + 12
+                            onClicked: {
+                                if (root.inCaptureStudio) {
+                                    root.inCaptureStudio = false;
+                                } else {
+                                    root.enterCaptureStudio(false);
+                                }
+                            }
+                            contentItem: Text {
+                                id: headerHubToggleBtnText
+                                text: headerHubToggleBtn.text
+                                color: root.avGoldBright
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                color: headerHubToggleBtn.hovered ? "#42BAA164" : "#24BAA164"
+                                border.color: root.avGoldBright
+                                border.width: 1
+                            }
+                        }
 
                         Text {
-                            text: (bridge.projectName !== "" && bridge.projectName !== "No Active Project")
-                                ? ("● PROJECT: " + bridge.projectName)
-                                : "○ NO PROJECT"
-                            color: (bridge.projectName !== "" && bridge.projectName !== "No Active Project")
-                                ? root.avGoldBright
-                                : root.avWhiteMuted
+                            text: "● " + root.hubActiveProjectDisplay + " / " + root.activeDatasetName
+                            color: root.avWhiteWarm
                             font.pixelSize: 10
                             font.bold: true
+                            Layout.maximumWidth: 190
+                            elide: Text.ElideRight
                         }
 
                         Rectangle {
@@ -566,12 +841,1051 @@ ApplicationWindow {
             }
         }
 
+        // =====================================================================
+        // PAGE 0: PROJECTS, DATASETS, SCANNER PROFILE & C-SLAM HUB (scanarMini)
+        // Initial screen prior to Scan Capture Studio:
+        //   1 · Select or Create Project
+        //   2 · Choose or Create Dataset + Select Scanner Profile + Start Scan
+        //   3 · Active C-SLAM Captures on Network (Join Collaborative Scan)
+        // =====================================================================
+        ColumnLayout {
+            id: projectsHubPage
+            visible: !root.inCaptureStudio
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 10
+
+            // -----------------------------------------------------------------
+            // TOP HUB ACTION BANNER (Matches scanarMini hub_banner, 58px)
+            // -----------------------------------------------------------------
+            Rectangle {
+                id: hubBannerCard
+                Layout.fillWidth: true
+                Layout.preferredHeight: 58
+                radius: 12
+                color: Qt.rgba(1, 1, 1, 0.04 + (root.glassOpacityPct / 100.0) * 0.06)
+                border.color: "#6BBAA164" // rgba(186, 161, 100, 0.42)
+                border.width: 1
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 16
+                    anchors.rightMargin: 16
+                    spacing: 12
+
+                    ColumnLayout {
+                        spacing: 2
+                        Text {
+                            text: "PROJECTS, DATASETS & COLLABORATIVE C-SLAM HUB"
+                            color: root.avWhiteWarm
+                            font.pixelSize: 14
+                            font.bold: true
+                            font.letterSpacing: 0.6
+                        }
+                        Text {
+                            text: "1. Choose or create a Project & Dataset (or join a C-SLAM Capture)   ·   2. Select a Scanner Profile   ·   3. Start Scanning"
+                            color: root.avGoldBright
+                            font.pixelSize: 11
+                        }
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    // Unprofiled Hardware Alert Button (Visible whenever an unprofiled sensor is plugged in)
+                    Button {
+                        visible: bridge.unprofiledDeviceCount > 0
+                        text: "⚠️ Confirm New Sensor (" + bridge.unprofiledDeviceCount + ")"
+                        implicitHeight: 34
+                        implicitWidth: implicitContentWidth + 22
+                        onClicked: {
+                            bridge.promptUnprofiledDevice("");
+                            unprofiledSensorConfirmDialog.openWithDevice(bridge.pendingUnprofiledDevice);
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: "#11100C"
+                            font.pixelSize: 11
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 8
+                            color: parent.hovered ? "#FBBF24" : root.avStatusWarn
+                            border.color: "#FDE68A"
+                            border.width: 1
+                        }
+                    }
+
+                    // Active Profile Quick Badge + Auto-Detect Mode Pill in Hub Banner
+                    Rectangle {
+                        height: 34
+                        width: bannerProfileRow.implicitWidth + 18
+                        radius: 8
+                        color: "#1ABAA164"
+                        border.color: "#7ABAA164"
+                        border.width: 1
+
+                        RowLayout {
+                            id: bannerProfileRow
+                            anchors.centerIn: parent
+                            spacing: 8
+
+                            Button {
+                                text: bridge.autoDetectHardware ? "⚡ AUTO-DETECT" : "✋ MANUAL"
+                                implicitHeight: 24
+                                implicitWidth: bridge.autoDetectHardware ? 104 : 78
+                                onClicked: bridge.autoDetectHardware = !bridge.autoDetectHardware
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: bridge.autoDetectHardware ? "#0B0C0E" : root.avGoldBright
+                                    font.pixelSize: 9
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 5
+                                    color: bridge.autoDetectHardware ? root.avStatusOk : "#26BAA164"
+                                    border.color: bridge.autoDetectHardware ? "#86EFAC" : root.avGoldPrimary
+                                    border.width: 1
+                                }
+                            }
+
+                            Text {
+                                text: "🛰️ " + (bridge.selectedScannerName || "RoboSense RS-Airy")
+                                color: root.avGoldBright
+                                font.pixelSize: 11
+                                font.bold: true
+                            }
+
+                            Button {
+                                text: "⚙ Configure"
+                                implicitHeight: 24
+                                implicitWidth: 82
+                                onClicked: configureSensorsDialog.open()
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: parent.hovered ? "#38BAA164" : "#1FFFFFFF"
+                                    border.color: "#59BAA164"
+                                    border.width: 1
+                                }
+                            }
+                        }
+                    }
+
+                    // Resume Capture Studio CTA (Matches scanarMini btn_resume_studio)
+                    Button {
+                        id: btnResumeStudio
+                        text: "▶  RESUME CAPTURE STUDIO  →"
+                        implicitHeight: 36
+                        implicitWidth: 220
+                        onClicked: root.enterCaptureStudio(false)
+                        contentItem: Text {
+                            text: btnResumeStudio.text
+                            color: root.avWhiteWarm
+                            font.pixelSize: 12
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 8
+                            color: btnResumeStudio.hovered ? "#70BAA164" : "#47BAA164"
+                            border.color: root.avGoldBright
+                            border.width: 1
+                        }
+                    }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // 3-COLUMN GLASS CARDS ROW (Matches scanarMini cols_row)
+            // -----------------------------------------------------------------
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                spacing: 14
+
+                // =============================================================
+                // COLUMN 1: PROJECTS (SELECT OR CREATE PROJECT)
+                // =============================================================
+                Rectangle {
+                    id: colProjectsCard
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.preferredWidth: 330
+                    radius: 12
+                    color: Qt.rgba(1, 1, 1, 0.04 + (root.glassOpacityPct / 100.0) * 0.06)
+                    border.color: "#52BAA164" // rgba(186, 161, 100, 0.32)
+                    border.width: 1
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 14
+                        spacing: 10
+
+                        Text {
+                            text: "1 · SELECT OR CREATE PROJECT"
+                            color: root.avGoldBright
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        Text {
+                            text: "Organize scans by building, site, or job:"
+                            color: "#B8FCFBF8"
+                            font.pixelSize: 11
+                        }
+
+                        // Project List Container (Matches scanarMini self.project_list_widget)
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            radius: 8
+                            color: "#0AFFFFFF"
+                            border.color: "#47BAA164"
+                            border.width: 1
+                            clip: true
+
+                            ListView {
+                                id: hubProjectListView
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 4
+                                model: root.getHubProjectsList()
+
+                                delegate: Rectangle {
+                                    property bool isSelected: modelData.name === root.hubActiveProjectDisplay
+                                    width: hubProjectListView.width
+                                    height: 40
+                                    radius: 6
+                                    color: isSelected ? "#42BAA164" : (projItemMouse.containsMouse ? "#17FFFFFF" : "transparent")
+                                    border.color: isSelected ? root.avGoldBright : "transparent"
+                                    border.width: isSelected ? 1 : 0
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 10
+                                        anchors.rightMargin: 10
+                                        spacing: 8
+
+                                        Text {
+                                            text: "📁  " + modelData.name + "   (" + modelData.datasetCount + (modelData.datasetCount === 1 ? " dataset)" : " datasets)")
+                                            color: parent.parent.isSelected ? root.avWhiteWarm : "#E6FCFBF8"
+                                            font.pixelSize: 12
+                                            font.bold: parent.parent.isSelected
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                        }
+
+                                        Text {
+                                            visible: parent.parent.isSelected
+                                            text: "ACTIVE"
+                                            color: root.avGoldBright
+                                            font.pixelSize: 9
+                                            font.bold: true
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: projItemMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.selectHubProject(modelData)
+                                    }
+                                }
+                            }
+                        }
+
+                        // New Project Creation Row (Matches scanarMini new_proj_input + btn_create_project)
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+
+                            TextField {
+                                id: newProjectInput
+                                Layout.fillWidth: true
+                                implicitHeight: 34
+                                placeholderText: "New Project Name (e.g. Site_Tower_A)"
+                                placeholderTextColor: "#73FCFBF8"
+                                color: root.avWhiteWarm
+                                font.pixelSize: 11
+                                selectByMouse: true
+                                onAccepted: {
+                                    root.createNewProjectFromHub(newProjectInput.text);
+                                    newProjectInput.text = "";
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: "#12FFFFFF"
+                                    border.color: newProjectInput.activeFocus ? root.avGoldBright : "#59BAA164"
+                                    border.width: 1
+                                }
+                            }
+
+                            Button {
+                                id: btnCreateProject
+                                text: "+ New Project"
+                                implicitHeight: 34
+                                implicitWidth: 112
+                                onClicked: {
+                                    root.createNewProjectFromHub(newProjectInput.text);
+                                    newProjectInput.text = "";
+                                }
+                                contentItem: Text {
+                                    text: btnCreateProject.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: btnCreateProject.hovered ? "#59BAA164" : "#38BAA164"
+                                    border.color: root.avGoldBright
+                                    border.width: 1
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // =============================================================
+                // COLUMN 2: PROJECT DATASETS & SCANNER PROFILE SELECTION
+                // =============================================================
+                Rectangle {
+                    id: colDatasetsCard
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.preferredWidth: 450
+                    radius: 12
+                    color: Qt.rgba(1, 1, 1, 0.04 + (root.glassOpacityPct / 100.0) * 0.06)
+                    border.color: "#52BAA164" // rgba(186, 161, 100, 0.32)
+                    border.width: 1
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 14
+                        spacing: 8
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: "2 · PROJECT DATASETS (SCAN SESSIONS)"
+                                color: root.avGoldBright
+                                font.pixelSize: 12
+                                font.bold: true
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text {
+                                id: hubActiveProjectLbl
+                                text: "Active Project: " + root.hubActiveProjectDisplay
+                                color: root.avWhiteWarm
+                                font.pixelSize: 11
+                                font.bold: true
+                            }
+                        }
+
+                        // Dataset List Container (Matches scanarMini self.dataset_list_widget)
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.minimumHeight: 110
+                            radius: 8
+                            color: "#0AFFFFFF"
+                            border.color: "#47BAA164"
+                            border.width: 1
+                            clip: true
+
+                            ListView {
+                                id: hubDatasetListView
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 4
+                                model: root.getHubDatasetsListFor(root.hubActiveProjectDisplay, root.hubSelectedProjectId)
+
+                                delegate: Rectangle {
+                                    property bool isSelected: modelData.name === root.activeDatasetName || index === root.selectedHubDatasetIndex
+                                    width: hubDatasetListView.width
+                                    height: 36
+                                    radius: 6
+                                    color: isSelected ? "#42BAA164" : (dsItemMouse.containsMouse ? "#17FFFFFF" : "transparent")
+                                    border.color: isSelected ? root.avGoldBright : "transparent"
+                                    border.width: isSelected ? 1 : 0
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 10
+                                        anchors.rightMargin: 10
+                                        spacing: 8
+
+                                        Text {
+                                            text: "🗂  " + modelData.name + "   ·   " + (modelData.saved ? ("✓ Saved (" + modelData.points + " pts)") : "Ready to Scan")
+                                            color: parent.parent.isSelected ? root.avWhiteWarm : "#E6FCFBF8"
+                                            font.pixelSize: 12
+                                            font.bold: parent.parent.isSelected
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: dsItemMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            root.selectedHubDatasetIndex = index;
+                                            root.activeDatasetName = modelData.name;
+                                            if (modelData.captureId && modelData.captureId !== "") {
+                                                bridge.loadSavedCapture(modelData.captureId);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Dataset Metadata Box (Matches scanarMini self.dataset_meta_lbl)
+                        Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 40
+                            radius: 6
+                            color: "#0AFFFFFF"
+                            border.color: "#2EFFFFFF"
+                            border.width: 1
+
+                            Text {
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                text: {
+                                    var dsList = root.getHubDatasetsListFor(root.hubActiveProjectDisplay, root.hubSelectedProjectId);
+                                    var d = (root.selectedHubDatasetIndex >= 0 && root.selectedHubDatasetIndex < dsList.length)
+                                        ? dsList[root.selectedHubDatasetIndex]
+                                        : (dsList.length > 0 ? dsList[0] : {"name": root.activeDatasetName, "created": "Now", "saved": false, "points": 0});
+                                    return "Project: " + root.hubActiveProjectDisplay + "  ·  Dataset: " + d.name + "\nCreated: " + d.created + "  ·  Status: " + (d.saved ? "Saved on Disk" : "Ready for Live Capture") + "  ·  Points: " + d.points;
+                                }
+                                color: "#B8FCFBF8"
+                                font.pixelSize: 10
+                                font.family: "Monospace"
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        // New Dataset Row (Matches scanarMini new_dataset_input + btn_create_dataset)
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+
+                            TextField {
+                                id: newDatasetInput
+                                Layout.fillWidth: true
+                                implicitHeight: 32
+                                placeholderText: "Dataset Name (e.g. Floor1_North)"
+                                placeholderTextColor: "#73FCFBF8"
+                                color: root.avWhiteWarm
+                                font.pixelSize: 11
+                                selectByMouse: true
+                                onAccepted: {
+                                    root.createNewDatasetFromHub(newDatasetInput.text);
+                                    newDatasetInput.text = "";
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: "#12FFFFFF"
+                                    border.color: newDatasetInput.activeFocus ? root.avGoldBright : "#59BAA164"
+                                    border.width: 1
+                                }
+                            }
+
+                            Button {
+                                id: btnCreateDataset
+                                text: "+ New Dataset"
+                                implicitHeight: 32
+                                implicitWidth: 112
+                                onClicked: {
+                                    root.createNewDatasetFromHub(newDatasetInput.text);
+                                    newDatasetInput.text = "";
+                                }
+                                contentItem: Text {
+                                    text: btnCreateDataset.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: btnCreateDataset.hovered ? "#59BAA164" : "#38BAA164"
+                                    border.color: root.avGoldBright
+                                    border.width: 1
+                                }
+                            }
+                        }
+
+                        // -----------------------------------------------------
+                        // SELECT SCANNER PROFILE SECTION (Single or Multi-Sensor)
+                        // "choose or create a dataset or join a capture and then select a profile and start scanning"
+                        // -----------------------------------------------------
+                        Rectangle {
+                            Layout.fillWidth: true
+                            height: 1
+                            color: "#38BAA164"
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+
+                            Text {
+                                text: "SELECT SCANNER PROFILE (AUTO-DETECT OR MANUAL)"
+                                color: root.avGoldBright
+                                font.pixelSize: 11
+                                font.bold: true
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                            }
+
+                            Button {
+                                text: "+ Profile"
+                                implicitHeight: 24
+                                implicitWidth: 64
+                                onClicked: {
+                                    bridge.initCreateProfileForm();
+                                    createProfileDialog.open();
+                                }
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: root.avGoldBright
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 5
+                                    color: parent.hovered ? "#38BAA164" : "#1FBAA164"
+                                    border.color: "#7ABAA164"
+                                    border.width: 1
+                                }
+                            }
+
+                            Button {
+                                text: "📚 Catalog"
+                                implicitHeight: 24
+                                implicitWidth: 68
+                                onClicked: {
+                                    configureSensorsDialog.currentTab = 2;
+                                    configureSensorsDialog.open();
+                                }
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 5
+                                    color: parent.hovered ? "#2EFFFFFF" : "#14FFFFFF"
+                                    border.color: "#3DFFFFFF"
+                                    border.width: 1
+                                }
+                            }
+                        }
+
+                        // Live Hardware Auto-Detect & Manual Override Bar
+                        Rectangle {
+                            Layout.fillWidth: true
+                            height: 30
+                            radius: 6
+                            color: bridge.autoDetectHardware ? "#144ADE80" : "#1FBAA164"
+                            border.color: bridge.autoDetectHardware ? "#594ADE80" : "#7ABAA164"
+                            border.width: 1
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 6
+                                spacing: 6
+
+                                Button {
+                                    text: bridge.autoDetectHardware ? "⚡ AUTO: ON" : "✋ MANUAL"
+                                    implicitHeight: 20
+                                    implicitWidth: 78
+                                    onClicked: bridge.autoDetectHardware = !bridge.autoDetectHardware
+                                    contentItem: Text {
+                                        text: parent.text
+                                        color: bridge.autoDetectHardware ? "#090A0D" : root.avGoldBright
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    background: Rectangle {
+                                        radius: 4
+                                        color: bridge.autoDetectHardware ? root.avStatusOk : "#2EFFFFFF"
+                                        border.color: bridge.autoDetectHardware ? "#86EFAC" : root.avGoldPrimary
+                                        border.width: 1
+                                    }
+                                }
+
+                                Text {
+                                    text: bridge.autoDetectSummary || "Auto-Detect Active"
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 10
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+
+                                Button {
+                                    visible: bridge.unprofiledDeviceCount > 0
+                                    text: "⚠️ Setup (" + bridge.unprofiledDeviceCount + ")"
+                                    implicitHeight: 20
+                                    implicitWidth: 74
+                                    onClicked: {
+                                        bridge.promptUnprofiledDevice("");
+                                        unprofiledSensorConfirmDialog.openWithDevice(bridge.pendingUnprofiledDevice);
+                                    }
+                                    contentItem: Text {
+                                        text: parent.text
+                                        color: "#11100C"
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    background: Rectangle {
+                                        radius: 4
+                                        color: root.avStatusWarn
+                                    }
+                                }
+
+                                Button {
+                                    text: "🔄 Detect"
+                                    implicitHeight: 20
+                                    implicitWidth: 60
+                                    onClicked: bridge.triggerAutoDetectNow()
+                                    contentItem: Text {
+                                        text: parent.text
+                                        color: root.avGoldBright
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    background: Rectangle {
+                                        radius: 4
+                                        color: parent.hovered ? "#38BAA164" : "#1FFFFFFF"
+                                        border.color: "#6BBAA164"
+                                        border.width: 1
+                                    }
+                                }
+                            }
+                        }
+
+                        // Selectable Scanner Profile List (Click any profile to manually select/override)
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 96
+                            radius: 8
+                            color: "#0AFFFFFF"
+                            border.color: "#47BAA164"
+                            border.width: 1
+                            clip: true
+
+                            ListView {
+                                id: hubScannerProfileListView
+                                anchors.fill: parent
+                                anchors.margins: 5
+                                spacing: 4
+                                model: bridge.scannerList
+
+                                delegate: Rectangle {
+                                    property bool isSelectedProfile: (modelData.id === bridge.selectedScannerId) || (index === bridge.selectedScannerIndex)
+                                    width: hubScannerProfileListView.width
+                                    height: 34
+                                    radius: 6
+                                    color: isSelectedProfile ? "#38BAA164" : (profMouse.containsMouse ? "#17FFFFFF" : "transparent")
+                                    border.color: isSelectedProfile ? root.avGoldBright : "#1FFFFFFF"
+                                    border.width: 1
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 8
+                                        anchors.rightMargin: 8
+                                        spacing: 8
+
+                                        Text {
+                                            text: parent.parent.isSelectedProfile ? "●" : "○"
+                                            color: parent.parent.isSelectedProfile ? root.avGoldBright : root.avWhiteMuted
+                                            font.pixelSize: 12
+                                            font.bold: true
+                                        }
+
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 0
+
+                                            Text {
+                                                text: modelData.name || "Scanner Profile"
+                                                color: parent.parent.parent.isSelectedProfile ? root.avWhiteWarm : "#E6FCFBF8"
+                                                font.pixelSize: 11
+                                                font.bold: parent.parent.parent.isSelectedProfile
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
+                                            }
+                                            Text {
+                                                text: modelData.details || "Spatial Capture Profile"
+                                                color: parent.parent.parent.isSelectedProfile ? root.avGoldBright : root.avWhiteMuted
+                                                font.pixelSize: 9
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            height: 18
+                                            width: profStatTxt.implicitWidth + 10
+                                            radius: 4
+                                            color: (modelData.status === "VALIDATED" || modelData.status === "CONFIG") ? "#1F22C55E" : "#1FBAA164"
+                                            border.color: (modelData.status === "VALIDATED" || modelData.status === "CONFIG") ? "#7022C55E" : "#7ABAA164"
+                                            border.width: 1
+
+                                            Text {
+                                                id: profStatTxt
+                                                anchors.centerIn: parent
+                                                text: modelData.status || "READY"
+                                                color: (modelData.status === "VALIDATED" || modelData.status === "CONFIG") ? root.avStatusOk : root.avGoldBright
+                                                font.pixelSize: 9
+                                                font.bold: true
+                                            }
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: profMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: bridge.selectScannerManual(index)
+                                    }
+                                }
+                            }
+                        }
+
+                        // Primary CTA Buttons: Open Studio OR Start Scanning Immediately
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Button {
+                                id: btnEnterStudio
+                                text: "▶  OPEN CAPTURE STUDIO"
+                                Layout.fillWidth: true
+                                implicitHeight: 40
+                                onClicked: root.enterCaptureStudio(false)
+                                contentItem: Text {
+                                    text: btnEnterStudio.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 8
+                                    color: btnEnterStudio.hovered ? "#70BAA164" : "#4DBAA164"
+                                    border.color: root.avGoldBright
+                                    border.width: 1
+                                }
+                            }
+
+                            Button {
+                                id: btnStartScanningFromHub
+                                text: "▶▶  SELECT PROFILE & START SCANNING  →"
+                                Layout.fillWidth: true
+                                implicitHeight: 40
+                                onClicked: root.enterCaptureStudio(true)
+                                contentItem: Text {
+                                    text: btnStartScanningFromHub.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 8
+                                    color: btnStartScanningFromHub.hovered ? "#5922C55E" : "#3822C55E"
+                                    border.color: root.avStatusOk
+                                    border.width: 1
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // =============================================================
+                // COLUMN 3: ACTIVE C-SLAM CAPTURES ON NETWORK
+                // Matches scanarMini col_cslam
+                // =============================================================
+                Rectangle {
+                    id: colCslamCard
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.preferredWidth: 370
+                    radius: 12
+                    color: Qt.rgba(1, 1, 1, 0.04 + (root.glassOpacityPct / 100.0) * 0.06)
+                    border.color: "#52BAA164" // rgba(186, 161, 100, 0.32)
+                    border.width: 1
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 14
+                        spacing: 10
+
+                        Text {
+                            text: "3 · ACTIVE C-SLAM CAPTURES ON NETWORK"
+                            color: root.avStatusOk
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        Text {
+                            id: cslamDiscoveryStatusLbl
+                            text: (bridge.cslamScannerCount > 1 || (bridge.discoveredNodes || []).length > 0)
+                                ? ("🟢 " + Math.max(bridge.cslamScannerCount, (bridge.discoveredNodes || []).length) + " Active C-SLAM Session(s) Discovered on Network")
+                                : "Listening on UDP 19440 / 9110 (LAN Broadcast + Unicast) for active scanners..."
+                            color: (bridge.cslamScannerCount > 1 || (bridge.discoveredNodes || []).length > 0) ? root.avStatusOk : "#B8FCFBF8"
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+
+                        // Active C-SLAM Captures List (Matches scanarMini self.active_captures_list)
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            radius: 8
+                            color: "#0AFFFFFF"
+                            border.color: "#5222C55E" // rgba(34, 197, 94, 0.32)
+                            border.width: 1
+                            clip: true
+
+                            // Empty-state placeholder matching scanarMini line 4179
+                            Text {
+                                anchors.fill: parent
+                                anchors.margins: 14
+                                visible: (bridge.cslamNodesList || []).length === 0
+                                text: "   (No active C-SLAM broadcasts detected yet — click '+ Sim Active Capture' or '+ Connect IP' below to discover or simulate a live multi-scanner session)"
+                                color: "#99FCFBF8"
+                                font.pixelSize: 11
+                                wrapMode: Text.WordWrap
+                            }
+
+                            ListView {
+                                id: hubActiveCapturesListView
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 4
+                                visible: (bridge.cslamNodesList || []).length > 0
+                                model: bridge.cslamNodesList
+
+                                delegate: Rectangle {
+                                    property bool isSelectedPeer: index === root.selectedHubCslamIndex
+                                    width: hubActiveCapturesListView.width
+                                    height: 48
+                                    radius: 6
+                                    color: isSelectedPeer ? "#3822C55E" : (peerMouse.containsMouse ? "#17FFFFFF" : "transparent")
+                                    border.color: isSelectedPeer ? root.avStatusOk : "#24FFFFFF"
+                                    border.width: 1
+
+                                    ColumnLayout {
+                                        anchors.fill: parent
+                                        anchors.margins: 6
+                                        spacing: 2
+
+                                        Text {
+                                            text: "📡  " + (modelData.name || "Peer_Scanner") + "  [" + (modelData.sensorModality || "LiDAR+RGBD") + " · " + (modelData.osType || "Linux") + "]"
+                                            color: root.avWhiteWarm
+                                            font.pixelSize: 11
+                                            font.bold: true
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                        }
+
+                                        Text {
+                                            text: "     Status: " + (modelData.overlapStatus || "STREAMING") + "   ·   Points: " + (modelData.pointCount || 0) + "   ·   Role: " + (modelData.isAnchor ? "ANCHOR" : "PEER")
+                                            color: root.avStatusOk
+                                            font.pixelSize: 10
+                                            font.family: "Monospace"
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: peerMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.selectedHubCslamIndex = index
+                                    }
+                                }
+                            }
+                        }
+
+                        // Selected Profile Banner for C-SLAM Join
+                        Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 30
+                            radius: 6
+                            color: "#14BAA164"
+                            border.color: "#47BAA164"
+                            border.width: 1
+
+                            Text {
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 10
+                                text: "Joining with Selected Profile: " + (bridge.selectedScannerName || "RoboSense RS-Airy")
+                                color: root.avGoldBright
+                                font.pixelSize: 10
+                                font.bold: true
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        // Manual Peer IP / Sim Active Capture Row (Matches scanarMini peer_row)
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+
+                            TextField {
+                                id: hubPeerIpInput
+                                Layout.fillWidth: true
+                                implicitHeight: 32
+                                placeholderText: "Remote Device IP (e.g. 192.168.1.50)"
+                                placeholderTextColor: "#73FCFBF8"
+                                color: root.avWhiteWarm
+                                font.pixelSize: 11
+                                selectByMouse: true
+                                onAccepted: {
+                                    if (hubPeerIpInput.text.trim() !== "") {
+                                        bridge.addManualPeer(hubPeerIpInput.text.trim(), 9110);
+                                        hubPeerIpInput.text = "";
+                                    }
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: "#12FFFFFF"
+                                    border.color: hubPeerIpInput.activeFocus ? root.avGoldBright : "#59BAA164"
+                                    border.width: 1
+                                }
+                            }
+
+                            Button {
+                                id: btnHubAddIp
+                                text: "+ Connect IP"
+                                implicitHeight: 32
+                                implicitWidth: 94
+                                onClicked: {
+                                    if (hubPeerIpInput.text.trim() !== "") {
+                                        bridge.addManualPeer(hubPeerIpInput.text.trim(), 9110);
+                                        hubPeerIpInput.text = "";
+                                    }
+                                }
+                                contentItem: Text {
+                                    text: btnHubAddIp.text
+                                    color: root.avGoldBright
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: btnHubAddIp.hovered ? "#47BAA164" : "#2EBAA164"
+                                    border.color: "#7ABAA164"
+                                    border.width: 1
+                                }
+                            }
+
+                            Button {
+                                id: btnHubSimCapture
+                                text: "+ Sim Active Capture"
+                                implicitHeight: 32
+                                implicitWidth: 138
+                                onClicked: {
+                                    bridge.addSimulatedCslamScanner("Peer_Rig_" + (bridge.cslamScannerCount + 1), false);
+                                }
+                                contentItem: Text {
+                                    text: btnHubSimCapture.text
+                                    color: root.avWhiteWarm
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 6
+                                    color: btnHubSimCapture.hovered ? "#38FFFFFF" : "#1FFFFFFF"
+                                    border.color: "#47FFFFFF"
+                                    border.width: 1
+                                }
+                            }
+                        }
+
+                        // Primary Join Button (Matches scanarMini btn_join_active_capture)
+                        Button {
+                            id: btnJoinActiveCapture
+                            text: "🌐  JOIN SELECTED CAPTURE WITH C-SLAM  →"
+                            Layout.fillWidth: true
+                            implicitHeight: 42
+                            onClicked: root.joinActiveCslamCapture()
+                            contentItem: Text {
+                                text: btnJoinActiveCapture.text
+                                color: root.avWhiteWarm
+                                font.pixelSize: 12
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 8
+                                color: btnJoinActiveCapture.hovered ? "#6122C55E" : "#3D22C55E"
+                                border.color: root.avStatusOk
+                                border.width: 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ---------------------------------------------------------------------
         // ROW 2: ACTION & SESSION CONTROL BAR (id: ctrlBar, height: 48)
         // Matches scanarMini ctrl_bar + retains all AV Scan workflow buttons
         // ---------------------------------------------------------------------
         Rectangle {
             id: ctrlBar
+            visible: root.inCaptureStudio
             Layout.fillWidth: true
             Layout.preferredHeight: 48
             radius: 11
@@ -581,24 +1895,50 @@ ApplicationWindow {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 12
-                anchors.rightMargin: 12
-                spacing: 8
+                anchors.leftMargin: 10
+                anchors.rightMargin: 10
+                spacing: 5
+
+                // 0. Back to Projects & C-SLAM Hub Button (Matches scanarMini btn_back_to_projects)
+                Button {
+                    id: btnBackToProjects
+                    text: "← PROJECTS"
+                    implicitHeight: 34
+                    implicitWidth: 92
+                    onClicked: root.inCaptureStudio = false
+                    contentItem: Text {
+                        text: btnBackToProjects.text
+                        color: root.avGoldBright
+                        font.pixelSize: 11
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 8
+                        color: btnBackToProjects.hovered ? "#47BAA164" : "#24BAA164"
+                        border.color: "#8CBAA164"
+                        border.width: 1
+                    }
+                }
 
                 // 1. Primary Action: ▶ START SCAN (matches scanarMini start_btn)
                 Button {
                     id: startBtn
-                    text: bridge.isCapturing ? "● SCANNING..." : "▶  START SCAN"
+                    text: bridge.isCapturing ? "● SCANNING..." : "▶ START SCAN"
                     enabled: !bridge.isCapturing
                     implicitHeight: 34
-                    implicitWidth: 136
-                    onClicked: bridge.startCapture()
+                    implicitWidth: 116
+                    onClicked: {
+                        root.ensureActiveProjectOpen();
+                        bridge.startCapture();
+                    }
                     contentItem: Text {
                         text: startBtn.text
                         color: startBtn.enabled ? root.avWhiteWarm : "#59FFFFFF"
-                        font.pixelSize: 12
+                        font.pixelSize: 11
                         font.bold: true
-                        font.letterSpacing: 0.5
+                        font.letterSpacing: 0.4
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
                     }
@@ -613,15 +1953,15 @@ ApplicationWindow {
                 // 2. Primary Action: ■ STOP (matches scanarMini stop_btn)
                 Button {
                     id: stopBtn
-                    text: "■  STOP"
+                    text: "■ STOP"
                     enabled: bridge.isCapturing
                     implicitHeight: 34
-                    implicitWidth: 92
+                    implicitWidth: 74
                     onClicked: bridge.stopCapture()
                     contentItem: Text {
                         text: stopBtn.text
                         color: stopBtn.enabled ? "#FCA5A5" : "#4DFFFFFF"
-                        font.pixelSize: 12
+                        font.pixelSize: 11
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
@@ -637,9 +1977,9 @@ ApplicationWindow {
                 // 3. Primary Action: ↓ SAVE DATASET (matches scanarMini save_btn)
                 Button {
                     id: saveBtn
-                    text: "↓  SAVE DATASET"
+                    text: "↓ SAVE DATASET"
                     implicitHeight: 34
-                    implicitWidth: 132
+                    implicitWidth: 118
                     onClicked: {
                         bridge.openCleanupWizard();
                         cleanupExportDialog.open();
@@ -647,7 +1987,7 @@ ApplicationWindow {
                     contentItem: Text {
                         text: saveBtn.text
                         color: root.avGoldBright
-                        font.pixelSize: 12
+                        font.pixelSize: 11
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
@@ -665,7 +2005,7 @@ ApplicationWindow {
                     id: liveCleanupHeaderBtn
                     text: bridge.liveCleanupEnabled ? "✦ M12 RT: ON" : "✦ M12 RT: OFF"
                     implicitHeight: 34
-                    implicitWidth: 112
+                    implicitWidth: 100
                     onClicked: bridge.liveCleanupEnabled = !bridge.liveCleanupEnabled
                     contentItem: Text {
                         text: liveCleanupHeaderBtn.text
@@ -686,7 +2026,7 @@ ApplicationWindow {
                 // 5. Elapsed Timer Pill (matches scanarMini timer_lbl)
                 Rectangle {
                     height: 34
-                    width: 86
+                    width: 78
                     radius: 9
                     color: "#0FFFFFFF"
                     border.color: "#38FFFFFF"
@@ -696,7 +2036,7 @@ ApplicationWindow {
                         anchors.centerIn: parent
                         text: "⏱ " + (bridge.elapsedTimeString || "00:00")
                         color: root.avWhiteWarm
-                        font.pixelSize: 12
+                        font.pixelSize: 11
                         font.family: "Monospace"
                         font.bold: true
                     }
@@ -708,17 +2048,45 @@ ApplicationWindow {
                     color: "#2EFFFFFF"
                 }
 
-                // 6. Active Scanner Profile Selector (Retained AV Scan Hardware Control)
+                // 6. Active Scanner Profile Selector + Auto-Detect / Manual Override Control
+                Button {
+                    id: ctrlAutoDetectBtn
+                    text: bridge.autoDetectHardware ? "⚡ AUTO" : "✋ MANUAL"
+                    implicitHeight: 32
+                    implicitWidth: bridge.autoDetectHardware ? 64 : 74
+                    enabled: !bridge.isCapturing
+                    onClicked: {
+                        if (!bridge.autoDetectHardware) {
+                            bridge.triggerAutoDetectNow();
+                        } else {
+                            bridge.autoDetectHardware = false;
+                        }
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: bridge.autoDetectHardware ? "#090A0D" : root.avGoldBright
+                        font.pixelSize: 10
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 8
+                        color: bridge.autoDetectHardware ? root.avStatusOk : "#1FBAA164"
+                        border.color: bridge.autoDetectHardware ? "#86EFAC" : root.avGoldPrimary
+                        border.width: 1
+                    }
+                }
+
                 ComboBox {
                     id: scannerCombo
                     model: bridge.availableScanners
-                    implicitWidth: 185
+                    currentIndex: bridge.selectedScannerIndex
+                    implicitWidth: 165
                     implicitHeight: 32
                     enabled: !bridge.isCapturing
                     onActivated: {
-                        if (currentText !== "") {
-                            bridge.selectScanner(currentText);
-                        }
+                        bridge.selectScannerManual(currentIndex);
                     }
                     contentItem: Text {
                         text: scannerCombo.displayText !== "" ? ("Scanner: " + scannerCombo.displayText) : "Select Scanner..."
@@ -737,6 +2105,31 @@ ApplicationWindow {
                     }
                 }
 
+                Button {
+                    visible: bridge.unprofiledDeviceCount > 0
+                    text: "⚠️ New Sensor (" + bridge.unprofiledDeviceCount + ")"
+                    implicitHeight: 32
+                    implicitWidth: 112
+                    onClicked: {
+                        bridge.promptUnprofiledDevice("");
+                        unprofiledSensorConfirmDialog.openWithDevice(bridge.pendingUnprofiledDevice);
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#11100C"
+                        font.pixelSize: 10
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 8
+                        color: parent.hovered ? "#FBBF24" : root.avStatusWarn
+                        border.color: "#FDE68A"
+                        border.width: 1
+                    }
+                }
+
                 Item { Layout.fillWidth: true }
 
                 // 7. Retained AV Scan Hardware & Studio Workflow Buttons (Apple Glass Pill Styling)
@@ -744,7 +2137,7 @@ ApplicationWindow {
                     id: mainCreateProfileBtn
                     text: "⚡ Profile"
                     implicitHeight: 32
-                    implicitWidth: 78
+                    implicitWidth: 68
                     onClicked: {
                         bridge.initCreateProfileForm();
                         createProfileDialog.open();
@@ -769,7 +2162,7 @@ ApplicationWindow {
                     id: mainConfigSensorsBtn
                     text: "⚙ Sensors"
                     implicitHeight: 32
-                    implicitWidth: 82
+                    implicitWidth: 74
                     onClicked: configureSensorsDialog.open()
                     contentItem: Text {
                         text: mainConfigSensorsBtn.text
@@ -791,7 +2184,7 @@ ApplicationWindow {
                     id: mainCatalogBtn
                     text: "📚 Catalog"
                     implicitHeight: 32
-                    implicitWidth: 82
+                    implicitWidth: 74
                     onClicked: {
                         configureSensorsDialog.currentTab = 2;
                         configureSensorsDialog.open();
@@ -816,7 +2209,7 @@ ApplicationWindow {
                     id: orientationDiagBtn
                     text: "📐 Orient"
                     implicitHeight: 32
-                    implicitWidth: 76
+                    implicitWidth: 68
                     onClicked: {
                         bridge.openOrientationDiagnostic();
                         orientationDiagDialog.open();
@@ -841,7 +2234,7 @@ ApplicationWindow {
                     id: headerMultiNodeBtn
                     text: "🌐 Mesh (" + Math.max(1, bridge.cslamScannerCount) + ")"
                     implicitHeight: 32
-                    implicitWidth: 92
+                    implicitWidth: 82
                     onClicked: multiNodeDialog.open()
                     contentItem: Text {
                         text: headerMultiNodeBtn.text
@@ -863,7 +2256,7 @@ ApplicationWindow {
                     id: headerOfflineRegBtn
                     text: "🔀 Register"
                     implicitHeight: 32
-                    implicitWidth: 84
+                    implicitWidth: 76
                     onClicked: {
                         bridge.refreshRegistrationProjectScans();
                         offlineRegistrationDialog.open();
@@ -888,7 +2281,7 @@ ApplicationWindow {
                     id: headerFusionBtn
                     text: "🔗 Fusion"
                     implicitHeight: 32
-                    implicitWidth: 76
+                    implicitWidth: 68
                     onClicked: {
                         bridge.openCalibrationWizard();
                         calibrationFusionDialog.open();
@@ -913,7 +2306,7 @@ ApplicationWindow {
                     id: headerCleanupExportBtn
                     text: "✦ Cleanup"
                     implicitHeight: 32
-                    implicitWidth: 82
+                    implicitWidth: 74
                     onClicked: {
                         bridge.openCleanupWizard();
                         cleanupExportDialog.open();
@@ -943,6 +2336,7 @@ ApplicationWindow {
         // ---------------------------------------------------------------------
         RowLayout {
             id: mainWorkspaceSplit
+            visible: root.inCaptureStudio
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 10
@@ -8168,7 +9562,7 @@ ApplicationWindow {
                 }
             }
 
-            // Export Panel (.ply, .pcd, .xyz, .obj Mesh)
+            // Export Panel (.ply, .pcd, .xyz, .obj Mesh, .e57 Structured, .avproj Walkthrough)
             Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -8182,7 +9576,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
-                        text: "2. ONE-CLICK SPATIAL EXPORT (.PLY / .PCD / .XYZ / .OBJ SURFACE MESH)"
+                        text: "2. ONE-CLICK SPATIAL & WALKTHROUGH EXPORT (.PLY / .PCD / .XYZ / .OBJ / .E57 / .AVPROJ)"
                         color: "#D4BE8D"
                         font.pixelSize: 11
                         font.bold: true
@@ -8199,14 +9593,21 @@ ApplicationWindow {
                                 { fmt: "ply", label: "PLY (Point Cloud)" },
                                 { fmt: "pcd", label: "PCD (PCL Native)" },
                                 { fmt: "xyz", label: "XYZ (ASCII RGB)" },
-                                { fmt: "obj", label: "OBJ (3D Surface Mesh)" }
+                                { fmt: "obj", label: "OBJ (3D Surface Mesh)" },
+                                { fmt: "e57", label: "E57 (Structured + Panos)" },
+                                { fmt: "avbundle", label: "AV Showcase (.avproj)" }
                             ]
                             delegate: Button {
                                 text: modelData.label
                                 implicitHeight: 28
                                 onClicked: {
                                     cleanupExportDialog.exportFormat = modelData.fmt;
-                                    exportPathInput.text = "/home/scanar/av_scan/exports/" + (bridge.projectId !== "" ? bridge.projectId : "scan_export") + "." + modelData.fmt;
+                                    var baseName = bridge.projectId !== "" ? bridge.projectId : "scan_export";
+                                    if (modelData.fmt === "avbundle") {
+                                        exportPathInput.text = "/home/scanar/av_scan/exports/" + baseName + "_walkthrough";
+                                    } else {
+                                        exportPathInput.text = "/home/scanar/av_scan/exports/" + baseName + "." + modelData.fmt;
+                                    }
                                 }
                                 contentItem: Text { text: parent.text; color: cleanupExportDialog.exportFormat === modelData.fmt ? "#09090B" : "#14141A"; font.pixelSize: 11; font.bold: cleanupExportDialog.exportFormat === modelData.fmt; horizontalAlignment: Text.AlignHCenter }
                                 background: Rectangle {
@@ -8271,6 +9672,12 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    Shortcut {
+        sequence: "F"
+        enabled: bridge.isCapturing
+        onActivated: bridge.dropFlashStationAnchor("")
     }
 
     // Notification Toast Popup
@@ -8572,6 +9979,414 @@ ApplicationWindow {
                             : "Ready — Launching Clear AR Passthrough Workspace...")
                     color: root.avGoldBright
                     font.pixelSize: 11
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // LIVE HARDWARE HOTPLUG & UNPROFILED SENSOR CONFIRMATION DIALOG
+    // Automatically prompts the user when an unprofiled sensor is plugged in
+    // so they can confirm or adjust device parameters and auto-create a profile.
+    // =========================================================================
+    Connections {
+        target: bridge
+        function onUnprofiledDeviceDetected(deviceInfo) {
+            if (!root.showSplashScreen && deviceInfo && deviceInfo.id) {
+                unprofiledSensorConfirmDialog.openWithDevice(deviceInfo);
+            }
+        }
+    }
+
+    onShowSplashScreenChanged: {
+        if (!root.showSplashScreen && bridge.hasPendingUnprofiledPrompt) {
+            unprofiledSensorConfirmDialog.openWithDevice(bridge.pendingUnprofiledDevice);
+        }
+    }
+
+    Dialog {
+        id: unprofiledSensorConfirmDialog
+        anchors.centerIn: parent
+        width: 620
+        height: 540
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape
+
+        property var deviceData: ({})
+        property string editModelName: ""
+        property int selectedCategoryIdx: 0
+        property int selectedBackendIdx: 0
+
+        readonly property var categoryOptions: [
+            { label: "Monocular RGB Camera (UVC / V4L2)", family: "MONOCULAR_RGB_CAMERA", slamFamily: "Monocular Neural Reconstruction" },
+            { label: "Active Stereo RGB-D Camera + IMU", family: "STEREO_RGBD_CAMERA", slamFamily: "RGB-D Visual-Inertial Odometry" },
+            { label: "3D LiDAR + Internal IMU", family: "MECHANICAL_3D_LIDAR", slamFamily: "LiDAR-Inertial Odometry (LIO)" },
+            { label: "XR Smart Glasses (6-DoF VIO)", family: "XR_SMART_GLASSES_VIO", slamFamily: "Visual-Inertial Odometry (VIO)" },
+            { label: "Edge AI Vision Agent (Serial CDC-ACM)", family: "EDGE_AI_VISION_AGENT", slamFamily: "Edge AI Companion / Telemetry" }
+        ]
+
+        readonly property var backendOptions: [
+            "LingBot-Map",
+            "DA3-Streaming",
+            "GeminiRgbdBackend",
+            "AiryLioBackend",
+            "VitureVioBackend",
+            "NONE"
+        ]
+
+        function openWithDevice(dev) {
+            if (!dev || !dev.id) return;
+            deviceData = dev;
+            editModelName = dev.productName || dev.name || "Custom_Sensor";
+            confirmNameInput.text = editModelName;
+
+            var mod = (dev.modality || "").toUpperCase();
+            var recBackend = dev.recommendedBackend || "LingBot-Map";
+            if (mod.indexOf("VISION") !== -1 || (dev.driver || "") === "cdc_acm") {
+                selectedCategoryIdx = 4;
+                selectedBackendIdx = 5;
+            } else if (mod.indexOf("LIDAR") !== -1) {
+                selectedCategoryIdx = 2;
+                selectedBackendIdx = 3;
+            } else if (mod.indexOf("RGBD") !== -1) {
+                selectedCategoryIdx = 1;
+                selectedBackendIdx = 2;
+            } else {
+                selectedCategoryIdx = 0;
+                selectedBackendIdx = (recBackend.indexOf("DA3") !== -1) ? 1 : 0;
+            }
+            categoryCombo.currentIndex = selectedCategoryIdx;
+            backendCombo.currentIndex = selectedBackendIdx;
+            unprofiledSensorConfirmDialog.open();
+        }
+
+        background: Rectangle {
+            radius: 14
+            color: "#EB0B0C10"
+            border.color: root.avGoldBright
+            border.width: 1.5
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            // Header Banner
+            Rectangle {
+                Layout.fillWidth: true
+                height: 54
+                radius: 10
+                color: "#24BAA164"
+                border.color: "#7ABAA164"
+                border.width: 1
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 14
+                    anchors.rightMargin: 14
+                    spacing: 12
+
+                    Text {
+                        text: unprofiledSensorConfirmDialog.deviceData.icon || "🔌"
+                        font.pixelSize: 24
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 2
+
+                        Text {
+                            text: "NEW UNPROFILED SENSOR DETECTED"
+                            color: root.avGoldBright
+                            font.pixelSize: 13
+                            font.bold: true
+                            font.letterSpacing: 1.0
+                        }
+                        Text {
+                            text: "Confirm the hardware details below (or adjust if needed) to automatically generate its profile."
+                            color: root.avWhiteMuted
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+            }
+
+            // Probed Hardware Telemetry Card
+            Rectangle {
+                Layout.fillWidth: true
+                height: 132
+                radius: 10
+                color: "#12FFFFFF"
+                border.color: "#38FFFFFF"
+                border.width: 1
+
+                GridLayout {
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    columns: 2
+                    rowSpacing: 6
+                    columnSpacing: 16
+
+                    Text { text: "Detected Hardware:"; color: root.avWhiteMuted; font.pixelSize: 11; font.bold: true }
+                    Text {
+                        text: (unprofiledSensorConfirmDialog.deviceData.name || "Unknown Sensor") + " (" + (unprofiledSensorConfirmDialog.deviceData.manufacturer || "Generic") + ")"
+                        color: root.avWhiteWarm
+                        font.pixelSize: 11
+                        font.bold: true
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
+
+                    Text { text: "Bus & Endpoint:"; color: root.avWhiteMuted; font.pixelSize: 11; font.bold: true }
+                    Text {
+                        text: (unprofiledSensorConfirmDialog.deviceData.transport || unprofiledSensorConfirmDialog.deviceData.busType || "USB") + "  ·  " + (unprofiledSensorConfirmDialog.deviceData.primaryEndpoint || "N/A")
+                        color: root.avGoldBright
+                        font.pixelSize: 11
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
+
+                    Text { text: "USB VID:PID / Serial:"; color: root.avWhiteMuted; font.pixelSize: 11; font.bold: true }
+                    Text {
+                        text: (unprofiledSensorConfirmDialog.deviceData.vendorId || "----") + ":" + (unprofiledSensorConfirmDialog.deviceData.productId || "----") + "  ·  SN: " + (unprofiledSensorConfirmDialog.deviceData.serial || "N/A")
+                        color: root.avWhiteWarm
+                        font.pixelSize: 11
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
+
+                    Text { text: "Probed Capabilities:"; color: root.avWhiteMuted; font.pixelSize: 11; font.bold: true }
+                    Text {
+                        text: unprofiledSensorConfirmDialog.deviceData.nativeCapsDisplay || "Standard Hardware Stream"
+                        color: root.avStatusOk
+                        font.pixelSize: 11
+                        font.bold: true
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
+                }
+            }
+
+            // User Confirmation & Optional Adjustment Controls
+            Text {
+                text: "CONFIRM OR ADJUST PROFILE CONFIGURATION"
+                color: root.avGoldBright
+                font.pixelSize: 11
+                font.bold: true
+                font.letterSpacing: 0.8
+            }
+
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 2
+                rowSpacing: 10
+                columnSpacing: 14
+
+                Text {
+                    text: "Confirmed Model Name:"
+                    color: root.avWhiteWarm
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+                TextField {
+                    id: confirmNameInput
+                    Layout.fillWidth: true
+                    implicitHeight: 34
+                    text: unprofiledSensorConfirmDialog.editModelName
+                    placeholderText: "Enter sensor model name..."
+                    color: root.avWhitePure
+                    font.pixelSize: 12
+                    leftPadding: 10
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1AFFFFFF"
+                        border.color: confirmNameInput.activeFocus ? root.avGoldBright : "#59BAA164"
+                        border.width: 1
+                    }
+                }
+
+                Text {
+                    text: "Sensor Category:"
+                    color: root.avWhiteWarm
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+                ComboBox {
+                    id: categoryCombo
+                    Layout.fillWidth: true
+                    implicitHeight: 34
+                    model: [
+                        "Monocular RGB Camera (UVC / V4L2)",
+                        "Active Stereo RGB-D Camera + IMU",
+                        "3D LiDAR + Internal IMU",
+                        "XR Smart Glasses (6-DoF VIO)",
+                        "Edge AI Vision Agent (Serial CDC-ACM)"
+                    ]
+                    onActivated: {
+                        unprofiledSensorConfirmDialog.selectedCategoryIdx = currentIndex;
+                        if (currentIndex === 0) backendCombo.currentIndex = 0;
+                        else if (currentIndex === 1) backendCombo.currentIndex = 2;
+                        else if (currentIndex === 2) backendCombo.currentIndex = 3;
+                        else if (currentIndex === 3) backendCombo.currentIndex = 4;
+                        else if (currentIndex === 4) backendCombo.currentIndex = 5;
+                    }
+                    contentItem: Text {
+                        text: categoryCombo.displayText
+                        color: root.avWhiteWarm
+                        font.pixelSize: 11
+                        font.bold: true
+                        verticalAlignment: Text.AlignVCenter
+                        leftPadding: 10
+                    }
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1AFFFFFF"
+                        border.color: "#59BAA164"
+                        border.width: 1
+                    }
+                }
+
+                Text {
+                    text: "SLAM / 3D Backend:"
+                    color: root.avWhiteWarm
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+                ComboBox {
+                    id: backendCombo
+                    Layout.fillWidth: true
+                    implicitHeight: 34
+                    model: unprofiledSensorConfirmDialog.backendOptions
+                    onActivated: {
+                        unprofiledSensorConfirmDialog.selectedBackendIdx = currentIndex;
+                    }
+                    contentItem: Text {
+                        text: backendCombo.displayText
+                        color: root.avGoldBright
+                        font.pixelSize: 11
+                        font.bold: true
+                        verticalAlignment: Text.AlignVCenter
+                        leftPadding: 10
+                    }
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1AFFFFFF"
+                        border.color: "#59BAA164"
+                        border.width: 1
+                    }
+                }
+            }
+
+            CheckBox {
+                id: autoActivateCheck
+                checked: true
+                text: "Automatically select this sensor profile as the active scanner after creation"
+                contentItem: Text {
+                    text: autoActivateCheck.text
+                    color: root.avWhiteWarm
+                    font.pixelSize: 11
+                    leftPadding: autoActivateCheck.indicator.width + 8
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            Item { Layout.fillHeight: true }
+
+            // Action Buttons: Later / Manual Override vs Confirm & Auto-Create Profile
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Button {
+                    text: "Later / Manual Override"
+                    implicitHeight: 38
+                    implicitWidth: 170
+                    onClicked: {
+                        var devId = unprofiledSensorConfirmDialog.deviceData.id || "";
+                        bridge.dismissUnprofiledDevicePrompt(devId);
+                        unprofiledSensorConfirmDialog.close();
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: root.avWhiteMuted
+                        font.pixelSize: 11
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 8
+                        color: parent.hovered ? "#29FFFFFF" : "#14FFFFFF"
+                        border.color: "#3DFFFFFF"
+                        border.width: 1
+                    }
+                }
+
+                Button {
+                    text: "Open Hardware Inspector..."
+                    implicitHeight: 38
+                    implicitWidth: 175
+                    onClicked: {
+                        unprofiledSensorConfirmDialog.close();
+                        configureSensorsDialog.currentTab = 0;
+                        configureSensorsDialog.open();
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: root.avGoldBright
+                        font.pixelSize: 11
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 8
+                        color: parent.hovered ? "#38BAA164" : "#1FBAA164"
+                        border.color: "#7ABAA164"
+                        border.width: 1
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    id: btnConfirmCreateProfile
+                    text: "✓ Confirm & Auto-Create Profile"
+                    implicitHeight: 38
+                    implicitWidth: 230
+                    onClicked: {
+                        var devId = unprofiledSensorConfirmDialog.deviceData.id || "";
+                        var catIdx = Math.max(0, Math.min(categoryCombo.currentIndex, unprofiledSensorConfirmDialog.categoryOptions.length - 1));
+                        var catObj = unprofiledSensorConfirmDialog.categoryOptions[catIdx];
+                        var backendName = backendCombo.currentText || "LingBot-Map";
+                        var res = bridge.confirmAndCreateProfileForDevice(
+                            devId,
+                            confirmNameInput.text,
+                            catObj.family,
+                            catObj.slamFamily,
+                            backendName,
+                            autoActivateCheck.checked
+                        );
+                        if (res && res.success) {
+                            unprofiledSensorConfirmDialog.close();
+                        }
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#090A0D"
+                        font.pixelSize: 12
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 8
+                        color: parent.hovered ? root.avGoldBright : root.avGoldPrimary
+                        border.color: "#FFF3D1"
+                        border.width: 1
+                    }
                 }
             }
         }

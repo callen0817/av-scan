@@ -1,4 +1,5 @@
 #include "core/processing/point_cloud_processor.hpp"
+#include "core/processing/structured_walkthrough_exporter.hpp"
 #include "core/logging/logger.hpp"
 
 #include <pcl/point_cloud.h>
@@ -887,6 +888,10 @@ ProcessingStats PointCloudProcessor::cleanRealtimeFast(
 ExportFormat PointCloudProcessor::parseExportFormat(const std::string& format_str) {
     std::string s = format_str;
     std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+    if (s.find("AVBUNDLE") != std::string::npos || s.find("WALKTHROUGH") != std::string::npos || s.find("AVPROJ") != std::string::npos) {
+        return ExportFormat::AV_WALKTHROUGH_BUNDLE;
+    }
+    if (s.find("E57") != std::string::npos) return ExportFormat::E57_STRUCTURED;
     if (s.find("PLY") != std::string::npos && s.find("BIN") != std::string::npos) return ExportFormat::PLY_BINARY;
     if (s.find("PLY") != std::string::npos) return ExportFormat::PLY_ASCII;
     if (s.find("PCD") != std::string::npos && s.find("BIN") != std::string::npos) return ExportFormat::PCD_BINARY;
@@ -908,6 +913,10 @@ std::string PointCloudProcessor::exportFormatExtension(ExportFormat format) {
             return ".xyz";
         case ExportFormat::OBJ_MESH:
             return ".obj";
+        case ExportFormat::E57_STRUCTURED:
+            return ".e57";
+        case ExportFormat::AV_WALKTHROUGH_BUNDLE:
+            return "_walkthrough";
     }
     return ".ply";
 }
@@ -920,6 +929,8 @@ std::string PointCloudProcessor::exportFormatName(ExportFormat format) {
         case ExportFormat::PCD_BINARY: return "PCD (Binary)";
         case ExportFormat::XYZ_ASCII: return "XYZRGBI (ASCII)";
         case ExportFormat::OBJ_MESH: return "Wavefront OBJ (3D Surface Mesh)";
+        case ExportFormat::E57_STRUCTURED: return "ASTM E2807-11 Structured E57 (+360 Panos)";
+        case ExportFormat::AV_WALKTHROUGH_BUNDLE: return "AV Spatial Bundle v1.1 (E57 + Panos + KeyPlans + lod0.bin)";
     }
     return "PLY (ASCII)";
 }
@@ -1165,6 +1176,42 @@ ExportResult PointCloudProcessor::exportPointCloud(
         res.success = true;
         res.exported_points = mesh_pts.size();
         res.exported_triangles = triangles.size();
+    } else if (format == ExportFormat::E57_STRUCTURED || format == ExportFormat::AV_WALKTHROUGH_BUNDLE) {
+        WalkthroughExportConfig wcfg;
+        wcfg.export_e57 = true;
+        fs::path bundle_dir = p;
+        if (format == ExportFormat::E57_STRUCTURED) {
+            fs::path parent = p.has_parent_path() ? p.parent_path() : fs::current_path();
+            std::string stem = p.stem().string().empty() ? "scan_export" : p.stem().string();
+            bundle_dir = parent / (stem + "_walkthrough_bundle");
+        } else {
+            std::string ext_lower = p.extension().string();
+            std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+            if (ext_lower == ".avbundle" || ext_lower == ".json" || ext_lower == ".avproj") {
+                bundle_dir = p.parent_path() / p.stem();
+            }
+        }
+
+        auto bundle_res = StructuredWalkthroughExporter::exportWalkthroughBundle(
+            bundle_dir.string(), points, {}, {}, {}, wcfg, nullptr);
+        if (!bundle_res.success) {
+            res.error_message = bundle_res.error_message;
+            return res;
+        }
+
+        if (format == ExportFormat::E57_STRUCTURED) {
+            std::error_code copy_ec;
+            if (fs::path(bundle_res.structured_e57_path) != p) {
+                fs::copy_file(bundle_res.structured_e57_path, p, fs::copy_options::overwrite_existing, copy_ec);
+            }
+            res.file_path = p.string();
+            res.file_size_bytes = bundle_res.e57_size_bytes;
+        } else {
+            res.file_path = bundle_res.bundle_json_path;
+            res.file_size_bytes = bundle_res.e57_size_bytes;
+        }
+        res.success = true;
+        res.exported_points = points.size();
     }
 
     std::error_code ec;

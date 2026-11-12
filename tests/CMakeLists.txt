@@ -263,5 +263,17 @@ target_link_libraries(test_m7_m8_acceptance PRIVATE
 )
 add_test(NAME test_m7_m8_acceptance COMMAND test_m7_m8_acceptance)
 
+add_executable(test_walkthrough_interoperability acceptance/test_walkthrough_interoperability.cpp)
+target_link_libraries(test_walkthrough_interoperability PRIVATE
+    av_gui
+    av_platform
+    av_core
+    Qt5::Core
+    Qt5::Gui
+    Qt5::Quick
+    Qt5::Qml
+)
+add_test(NAME test_walkthrough_interoperability COMMAND test_walkthrough_interoperability)
+
 
 

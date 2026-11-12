@@ -54,6 +54,10 @@ endif()
 # Locate OpenMP
 find_package(OpenMP)
 
+# Locate JPEG and ZLIB (Structured E57 / AV Walkthrough Panoramas & Depth/KeyPlan PNGs)
+find_package(JPEG REQUIRED)
+find_package(ZLIB REQUIRED)
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 add_compile_definitions(AV_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 set(CMAKE_BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lib")

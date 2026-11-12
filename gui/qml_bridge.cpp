@@ -86,18 +86,23 @@ QmlBridge::QmlBridge(std::shared_ptr<core::storage::StorageEngine> storage,
         });
     }
 
+    hotplugTimer_ = new QTimer(this);
     connect(timer_, &QTimer::timeout, this, &QmlBridge::onTimerTick);
     connect(telemetryTimer_, &QTimer::timeout, this, &QmlBridge::onTelemetryTick);
+    connect(hotplugTimer_, &QTimer::timeout, this, &QmlBridge::onHotplugPollTick);
     connect(this, &QmlBridge::mapDataUpdated, this, [this]() { invalidateDisplayPointsCache(); });
     connect(this, &QmlBridge::orientationDiagChanged, this, [this]() { invalidateDisplayPointsCache(); });
     registrationEngine_ = std::make_unique<core::registration::RegistrationEngine>();
+    lastHardwareTopologyFingerprint_ = computeHardwareTopologyFingerprint();
     refreshData();
+    hotplugTimer_->start(2500);
     emit canStartChanged();
 }
 
 QmlBridge::~QmlBridge() {
-    if (timer_->isActive()) timer_->stop();
-    if (telemetryTimer_->isActive()) telemetryTimer_->stop();
+    if (timer_ && timer_->isActive()) timer_->stop();
+    if (telemetryTimer_ && telemetryTimer_->isActive()) telemetryTimer_->stop();
+    if (hotplugTimer_ && hotplugTimer_->isActive()) hotplugTimer_->stop();
     if (multiNodeOrchestrator_) {
         multiNodeOrchestrator_->shutdown();
     }
@@ -939,6 +944,96 @@ void QmlBridge::refreshDiscovery() {
     discoveredPhysicalDevices_ = list;
     discoveredDeviceCount_ = online_count;
     unprofiledDeviceCount_ = unprofiled_count;
+    lastHardwareTopologyFingerprint_ = computeHardwareTopologyFingerprint();
+
+    // Collect online profiled sensors and first unprofiled device
+    QStringList connectedProfileIds;
+    bool hasOnlineAiry = false;
+    bool hasOnlineGemini = false;
+    QVariantMap firstUnprofiled;
+
+    for (int i = 0; i < list.size(); ++i) {
+        QVariantMap m = list[i].toMap();
+        QString status = m["profileStatus"].toString();
+        QString existingId = m["existingProfileId"].toString();
+        QString nameLower = m["name"].toString().toLower() + " " + m["productName"].toString().toLower();
+
+        if (status == "PROFILED" && !existingId.isEmpty()) {
+            if (!connectedProfileIds.contains(existingId)) {
+                connectedProfileIds.append(existingId);
+            }
+            if (existingId.contains("airy", Qt::CaseInsensitive) || nameLower.contains("airy")) {
+                hasOnlineAiry = true;
+            }
+            if (existingId.contains("gemini", Qt::CaseInsensitive) || nameLower.contains("gemini")) {
+                hasOnlineGemini = true;
+            }
+        } else if (status == "UNPROFILED") {
+            QString devId = m["id"].toString();
+            if (firstUnprofiled.isEmpty() && !dismissedUnprofiledDeviceIds_.contains(devId)) {
+                firstUnprofiled = m;
+            }
+        }
+    }
+
+    // Automatic sensor profile selection when autoDetectHardware_ is enabled
+    if (autoDetectHardware_ && !isCapturing_) {
+        QString bestProfileId;
+        if (hasOnlineAiry && hasOnlineGemini) {
+            bestProfileId = "scanar_01";
+        } else if (!connectedProfileIds.isEmpty()) {
+            if (connectedProfileIds.contains(selectedScannerId_)) {
+                bestProfileId = selectedScannerId_;
+            } else {
+                bestProfileId = connectedProfileIds.first();
+            }
+        }
+
+        if (!bestProfileId.isEmpty()) {
+            if (selectedScannerId_ != bestProfileId) {
+                bool matchedIndex = false;
+                for (int i = 0; i < scannerList_.size(); ++i) {
+                    QVariantMap sm = scannerList_.at(i).toMap();
+                    if (sm["id"].toString() == bestProfileId) {
+                        selectScannerByIndex(i);
+                        matchedIndex = true;
+                        break;
+                    }
+                }
+                if (!matchedIndex) {
+                    selectedScannerId_ = bestProfileId;
+                    rebuildActiveSensorsForSelection();
+                    emit selectedScannerChanged();
+                }
+            }
+            autoDetectSummary_ = QString("Auto-Detected: %1").arg(selectedScannerName_.isEmpty() ? bestProfileId : selectedScannerName_);
+        } else if (online_count > 0 && unprofiled_count > 0) {
+            autoDetectSummary_ = QString("Auto-Detect: %1 Unprofiled Sensor(s) Connected").arg(unprofiled_count);
+        } else {
+            autoDetectSummary_ = "Auto-Detect: Monitoring USB & Ethernet...";
+        }
+        emit autoDetectStateChanged();
+    } else if (!autoDetectHardware_) {
+        autoDetectSummary_ = QString("Manual Override: %1").arg(selectedScannerName_.isEmpty() ? selectedScannerId_ : selectedScannerName_);
+        emit autoDetectStateChanged();
+    }
+
+    // Trigger in-app confirmation prompt if an unprofiled sensor is connected and not yet dismissed
+    if (!firstUnprofiled.isEmpty()) {
+        QString prevId = pendingUnprofiledDevice_.value("id").toString();
+        QString newId = firstUnprofiled.value("id").toString();
+        pendingUnprofiledDevice_ = firstUnprofiled;
+        bool wasPrompting = hasPendingUnprofiledPrompt_;
+        hasPendingUnprofiledPrompt_ = true;
+        emit pendingUnprofiledChanged();
+        if (!wasPrompting || prevId != newId) {
+            emit unprofiledDeviceDetected(pendingUnprofiledDevice_);
+        }
+    } else if (unprofiled_count == 0 && hasPendingUnprofiledPrompt_) {
+        hasPendingUnprofiledPrompt_ = false;
+        pendingUnprofiledDevice_.clear();
+        emit pendingUnprofiledChanged();
+    }
 
     QDateTime now = QDateTime::currentDateTime();
     discoveryStatusText_ = QString("Scan complete at %1: %2 physical sensor(s) detected (%3 unprofiled)")
@@ -950,6 +1045,136 @@ void QmlBridge::refreshDiscovery() {
     emit isDiscoveringChanged();
     emit discoveryStatusTextChanged();
     emit discoveredDevicesChanged();
+}
+
+std::string QmlBridge::computeHardwareTopologyFingerprint() const {
+    std::string fp;
+    std::error_code ec;
+
+    // 1. Check /sys/class/video4linux endpoints
+    if (fs::exists("/sys/class/video4linux", ec)) {
+        std::vector<std::string> v4l_nodes;
+        for (const auto& entry : fs::directory_iterator("/sys/class/video4linux", ec)) {
+            v4l_nodes.push_back(entry.path().filename().string());
+        }
+        std::sort(v4l_nodes.begin(), v4l_nodes.end());
+        for (const auto& n : v4l_nodes) fp += "v4l:" + n + ";";
+    }
+
+    // 2. Check /sys/bus/usb/devices VID:PID list
+    if (fs::exists("/sys/bus/usb/devices", ec)) {
+        std::vector<std::string> usb_devs;
+        for (const auto& entry : fs::directory_iterator("/sys/bus/usb/devices", ec)) {
+            fs::path vpath = entry.path() / "idVendor";
+            fs::path ppath = entry.path() / "idProduct";
+            if (fs::exists(vpath, ec) && fs::exists(ppath, ec)) {
+                std::ifstream vf(vpath), pf(ppath);
+                std::string v, p;
+                if (vf >> v && pf >> p) {
+                    usb_devs.push_back(entry.path().filename().string() + "=" + v + ":" + p);
+                }
+            }
+        }
+        std::sort(usb_devs.begin(), usb_devs.end());
+        for (const auto& u : usb_devs) fp += "usb:" + u + ";";
+    }
+
+    // 3. Check /sys/class/tty/ttyACM* endpoints
+    if (fs::exists("/sys/class/tty", ec)) {
+        std::vector<std::string> acm_nodes;
+        for (const auto& entry : fs::directory_iterator("/sys/class/tty", ec)) {
+            std::string name = entry.path().filename().string();
+            if (name.rfind("ttyACM", 0) == 0 || name.rfind("ttyUSB", 0) == 0) {
+                acm_nodes.push_back(name);
+            }
+        }
+        std::sort(acm_nodes.begin(), acm_nodes.end());
+        for (const auto& a : acm_nodes) fp += "tty:" + a + ";";
+    }
+
+    // 4. Check /sys/class/net carrier state for Ethernet LiDARs
+    if (fs::exists("/sys/class/net", ec)) {
+        std::vector<std::string> net_nodes;
+        for (const auto& entry : fs::directory_iterator("/sys/class/net", ec)) {
+            std::string ifname = entry.path().filename().string();
+            if (ifname == "lo") continue;
+            fs::path cpath = entry.path() / "carrier";
+            std::string carrier = "0";
+            if (fs::exists(cpath, ec)) {
+                std::ifstream cf(cpath);
+                cf >> carrier;
+            }
+            net_nodes.push_back(ifname + ":" + carrier);
+        }
+        std::sort(net_nodes.begin(), net_nodes.end());
+        for (const auto& n : net_nodes) fp += "net:" + n + ";";
+    }
+
+    return fp;
+}
+
+void QmlBridge::onHotplugPollTick() {
+    if (isDiscovering_ || isCapturing_) return;
+    std::string currentFp = computeHardwareTopologyFingerprint();
+    if (currentFp != lastHardwareTopologyFingerprint_) {
+        lastHardwareTopologyFingerprint_ = currentFp;
+        AV_LOG_INFO("QmlBridge", "Physical sensor hotplug change detected — running live hardware discovery");
+        refreshDiscovery();
+    }
+}
+
+void QmlBridge::setAutoDetectHardware(bool enabled) {
+    if (autoDetectHardware_ == enabled) return;
+    autoDetectHardware_ = enabled;
+    if (autoDetectHardware_) {
+        AV_LOG_INFO("QmlBridge", "Hardware Auto-Detection enabled");
+        refreshDiscovery();
+    } else {
+        autoDetectSummary_ = QString("Manual Override: %1").arg(selectedScannerName_.isEmpty() ? selectedScannerId_ : selectedScannerName_);
+        emit autoDetectStateChanged();
+    }
+}
+
+void QmlBridge::triggerAutoDetectNow() {
+    autoDetectHardware_ = true;
+    dismissedUnprofiledDeviceIds_.clear();
+    refreshData();
+    refreshDiscovery();
+    emit autoDetectStateChanged();
+}
+
+void QmlBridge::selectScannerManual(int index) {
+    if (index < 0 || index >= scannerList_.size()) return;
+    autoDetectHardware_ = false;
+    selectScannerByIndex(index);
+    autoDetectSummary_ = QString("Manual Override: %1").arg(selectedScannerName_);
+    emit autoDetectStateChanged();
+}
+
+void QmlBridge::dismissUnprofiledDevicePrompt(const QString& deviceId) {
+    QString targetId = deviceId.isEmpty() ? pendingUnprofiledDevice_.value("id").toString() : deviceId;
+    if (!targetId.isEmpty() && !dismissedUnprofiledDeviceIds_.contains(targetId)) {
+        dismissedUnprofiledDeviceIds_.append(targetId);
+    }
+    hasPendingUnprofiledPrompt_ = false;
+    pendingUnprofiledDevice_.clear();
+    emit pendingUnprofiledChanged();
+}
+
+void QmlBridge::promptUnprofiledDevice(const QString& deviceId) {
+    for (int i = 0; i < discoveredPhysicalDevices_.size(); ++i) {
+        QVariantMap m = discoveredPhysicalDevices_[i].toMap();
+        if (m["profileStatus"].toString() == "UNPROFILED") {
+            if (deviceId.isEmpty() || m["id"].toString() == deviceId) {
+                dismissedUnprofiledDeviceIds_.removeAll(m["id"].toString());
+                pendingUnprofiledDevice_ = m;
+                hasPendingUnprofiledPrompt_ = true;
+                emit pendingUnprofiledChanged();
+                emit unprofiledDeviceDetected(pendingUnprofiledDevice_);
+                return;
+            }
+        }
+    }
 }
 
 QVariantList QmlBridge::discoverHardwareDevices() {
@@ -1038,6 +1263,97 @@ QVariantMap QmlBridge::createProfileForDevice(const QString& deviceId) {
     res["filePath"] = QString::fromStdString((repo_root / "profiles" / "experimental" / (prof.profile_id() + ".json")).string());
 
     AV_LOG_INFO("QmlBridge", "Successfully generated and onboarded profile: " + prof.profile_id());
+    return res;
+}
+
+QVariantMap QmlBridge::confirmAndCreateProfileForDevice(const QString& deviceId,
+                                                        const QString& customName,
+                                                        const QString& customFamily,
+                                                        const QString& customSlamFamily,
+                                                        const QString& customSlamBackend,
+                                                        bool autoSelect) {
+    QVariantMap res;
+    res["success"] = false;
+
+    core::profiling::DeviceProfiler profiler;
+    fs::path repo_root = storage_ ? fs::path(storage_->getRootDirectory()) : fs::current_path();
+
+    auto phys_devs = profiler.discoverPhysicalDevices(repo_root);
+    const core::profiling::DeviceProfiler::DiscoveredPhysicalDevice* target_dev = nullptr;
+    for (const auto& d : phys_devs) {
+        if (QString::fromStdString(d.device_id) == deviceId ||
+            QString::fromStdString(d.primary_endpoint) == deviceId ||
+            (!d.vendor_id.empty() && deviceId.contains(QString::fromStdString(d.vendor_id)) &&
+             !d.product_id.empty() && deviceId.contains(QString::fromStdString(d.product_id)))) {
+            target_dev = &d;
+            break;
+        }
+    }
+
+    if (!target_dev) {
+        for (const auto& d : phys_devs) {
+            for (const auto& iface : d.interfaces) {
+                if (QString::fromStdString(iface.node_path) == deviceId) {
+                    target_dev = &d;
+                    break;
+                }
+            }
+            if (target_dev) break;
+        }
+    }
+
+    if (!target_dev) {
+        res["error"] = "Physical device not found on host: " + deviceId;
+        AV_LOG_ERROR("QmlBridge", "Confirm & Create Profile Failed", res["error"].toString().toStdString());
+        return res;
+    }
+
+    core::schemas::DeviceProfile prof = profiler.generateProfileFromPhysicalDevice(*target_dev);
+
+    // Apply optional user-confirmed adjustments from the in-app confirmation dialog
+    if (!customName.trimmed().isEmpty()) {
+        prof.set_model(customName.trimmed().toStdString());
+    }
+    if (!customFamily.trimmed().isEmpty()) {
+        prof.set_device_family(customFamily.trimmed().toStdString());
+    }
+    if (!customSlamFamily.trimmed().isEmpty()) {
+        prof.set_slam_family(customSlamFamily.trimmed().toStdString());
+    }
+    if (!customSlamBackend.trimmed().isEmpty()) {
+        prof.set_slam_backend(customSlamBackend.trimmed().toStdString());
+    }
+
+    bool save_ok = profiler.saveExperimentalProfile(prof, repo_root);
+    if (!save_ok) {
+        res["error"] = "Failed to write confirmed profile to disk";
+        AV_LOG_ERROR("QmlBridge", "Profile Save Failed", res["error"].toString().toStdString());
+        return res;
+    }
+
+    QString createdProfileId = QString::fromStdString(prof.profile_id());
+    dismissedUnprofiledDeviceIds_.removeAll(deviceId);
+    hasPendingUnprofiledPrompt_ = false;
+    pendingUnprofiledDevice_.clear();
+    emit pendingUnprofiledChanged();
+
+    refreshData();
+    if (autoSelect) {
+        selectProfileForCapture(createdProfileId);
+    }
+    refreshDiscovery();
+
+    res["success"] = true;
+    res["profileId"] = createdProfileId;
+    res["deviceName"] = QString::fromStdString(prof.manufacturer() + " " + prof.model());
+    res["manufacturer"] = QString::fromStdString(prof.manufacturer());
+    res["profileStatus"] = "EXPERIMENTAL";
+    res["compatibleReconstruction"] = QString::fromStdString(prof.slam_family());
+    res["selectedBackend"] = QString::fromStdString(prof.slam_backend());
+    res["filePath"] = QString::fromStdString((repo_root / "profiles" / "experimental" / (prof.profile_id() + ".json")).string());
+
+    emit notification("Sensor Profile Created",
+                      QString("Confirmed and created profile '%1' for %2.").arg(createdProfileId, res["deviceName"].toString()));
     return res;
 }
 
@@ -1542,6 +1858,7 @@ bool QmlBridge::startCapture() {
     pointsCaptured_ = 0;
     mapPoints_.clear();
     trajectory_.clear();
+    flashAnchors_.clear();
     currentPoseX_ = 0.0;
     currentPoseY_ = 0.0;
     currentPoseZ_ = 0.0;
@@ -1696,6 +2013,7 @@ bool QmlBridge::startCapture() {
     emit pointsCapturedChanged();
     emit poseChanged();
     emit trajectoryChanged();
+    emit flashAnchorsChanged();
     emit mapDataUpdated();
     emit activeSensorsChanged();
     emit airyTelemetryChanged();
@@ -2018,6 +2336,71 @@ bool QmlBridge::saveCapture() {
         }
 
         storage_->saveSession(session);
+
+        // 4. Persist Flash Station anchors and AV Spatial Bundle v1.1 + project.avproj
+        if (!flashAnchors_.empty()) {
+            nlohmann::json faj = nlohmann::json::array();
+            for (const auto& fa : flashAnchors_) {
+                faj.push_back({
+                    {"anchor_id", fa.anchor_id},
+                    {"label", fa.label},
+                    {"x", fa.position.x},
+                    {"y", fa.position.y},
+                    {"z", fa.position.z},
+                    {"yaw_rad", fa.yaw_rad},
+                    {"z_is_sensor_height", fa.z_is_sensor_height}
+                });
+            }
+            std::ofstream fa_out(sess_dir / "flash_anchors.json");
+            fa_out << faj.dump(2);
+            fa_out.close();
+        }
+
+        const std::vector<core::schemas::PointXYZI>* canonical_cloud = nullptr;
+        const std::vector<core::schemas::Pose3D>* canonical_traj = nullptr;
+        if (isFusionActive_ && !fusedMapPoints_.empty()) {
+            canonical_cloud = &fusedMapPoints_;
+            canonical_traj = &fusedTrajectory_;
+        } else if (!mapPoints_.empty()) {
+            canonical_cloud = &mapPoints_;
+            canonical_traj = &trajectory_;
+        } else {
+            for (const auto& s : activeSensors_) {
+                if (!s.map_points.empty() &&
+                    (!canonical_cloud || s.map_points.size() > canonical_cloud->size())) {
+                    canonical_cloud = &s.map_points;
+                    canonical_traj = &s.trajectory;
+                }
+            }
+        }
+
+        if (canonical_cloud && canonical_cloud->size() >= 10) {
+            core::processing::WalkthroughExportConfig wcfg;
+            wcfg.project_id = projectId_.toStdString();
+            wcfg.project_name = projectName_.isEmpty() ? projectId_.toStdString() : projectName_.toStdString();
+            wcfg.scan_id = currentSessionId_.toStdString();
+            wcfg.scan_date = QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd").toStdString();
+            fs::path proj_dir = fs::path(storage_->getRootDirectory()) / "projects" / projectId_.toStdString();
+            wcfg.av_showcase_project_dir = (proj_dir / "av_showcase").string();
+
+            auto wres = core::processing::StructuredWalkthroughExporter::exportWalkthroughBundle(
+                (sess_dir / "walkthrough_bundle").string(),
+                *canonical_cloud,
+                canonical_traj ? *canonical_traj : std::vector<core::schemas::Pose3D>{},
+                flashAnchors_,
+                {},
+                wcfg,
+                nullptr);
+            if (wres.success) {
+                lastExportPath_ = QString::fromStdString(
+                    wres.avproj_path.empty() ? wres.bundle_json_path : wres.avproj_path);
+                exportStatus_ = QString("Saved AV Spatial Bundle (%1 stations, %2 floors) -> %3")
+                    .arg(wres.station_count)
+                    .arg(wres.floor_count)
+                    .arg(lastExportPath_);
+                emit exportStateChanged();
+            }
+        }
 
         canSave_ = false;
         captureState_ = "SAVED";
@@ -4809,12 +5192,13 @@ QString QmlBridge::exportActivePointCloud(const QString& formatStr,
     auto fmt = core::processing::PointCloudProcessor::parseExportFormat(formatStr.toStdString());
     std::string ext = core::processing::PointCloudProcessor::exportFormatExtension(fmt);
 
+    fs::path base_dir = storage_ ? fs::path(storage_->getRootDirectory()) : fs::current_path();
+    std::string pid = projectId_.isEmpty() ? "workspace" : projectId_.toStdString();
+
     fs::path out_path;
     if (!customOutputPath.trimmed().isEmpty()) {
         out_path = customOutputPath.trimmed().toStdString();
     } else {
-        fs::path base_dir = storage_ ? fs::path(storage_->getRootDirectory()) : fs::current_path();
-        std::string pid = projectId_.isEmpty() ? "workspace" : projectId_.toStdString();
         fs::path export_dir = base_dir / "projects" / pid / "exports";
         fs::create_directories(export_dir);
 
@@ -4822,6 +5206,67 @@ QString QmlBridge::exportActivePointCloud(const QString& formatStr,
         uint64_t ts_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
         std::string sensor_tag = activeDisplaySensor_.isEmpty() ? "map" : activeDisplaySensor_.toLower().toStdString();
         out_path = export_dir / (pid + "_" + sensor_tag + "_" + std::to_string(ts_sec) + ext);
+    }
+
+    if (fmt == core::processing::ExportFormat::E57_STRUCTURED ||
+        fmt == core::processing::ExportFormat::AV_WALKTHROUGH_BUNDLE) {
+        core::processing::WalkthroughExportConfig wcfg;
+        wcfg.export_e57 = true;
+        wcfg.project_id = pid;
+        wcfg.project_name = projectName_.isEmpty() ? pid : projectName_.toStdString();
+        wcfg.scan_id = currentSessionId_.isEmpty()
+            ? ("export_" + std::to_string(QDateTime::currentSecsSinceEpoch()))
+            : currentSessionId_.toStdString();
+        wcfg.scan_date = QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd").toStdString();
+        if (fmt == core::processing::ExportFormat::AV_WALKTHROUGH_BUNDLE) {
+            wcfg.av_showcase_project_dir = (base_dir / "projects" / pid / "av_showcase").string();
+        }
+
+        fs::path bundle_dir = out_path;
+        if (fmt == core::processing::ExportFormat::E57_STRUCTURED) {
+            fs::path parent = out_path.has_parent_path() ? out_path.parent_path() : fs::current_path();
+            std::string stem = out_path.stem().string().empty() ? "scan_export" : out_path.stem().string();
+            bundle_dir = parent / (stem + "_walkthrough_bundle");
+        } else {
+            std::string ext_lower = out_path.extension().string();
+            std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+            if (ext_lower == ".avbundle" || ext_lower == ".json" || ext_lower == ".avproj") {
+                bundle_dir = out_path.parent_path() / out_path.stem();
+            }
+        }
+
+        auto wres = core::processing::StructuredWalkthroughExporter::exportWalkthroughBundle(
+            bundle_dir.string(), mapPoints_, trajectory_, flashAnchors_, {}, wcfg, nullptr);
+        if (!wres.success) {
+            exportStatus_ = "Export failed: " + QString::fromStdString(wres.error_message);
+            emit exportStateChanged();
+            emit errorOccurred("Export Failed", exportStatus_);
+            return "";
+        }
+
+        if (fmt == core::processing::ExportFormat::E57_STRUCTURED) {
+            std::error_code copy_ec;
+            if (out_path.has_parent_path()) {
+                fs::create_directories(out_path.parent_path(), copy_ec);
+            }
+            if (fs::path(wres.structured_e57_path) != out_path) {
+                fs::copy_file(wres.structured_e57_path, out_path, fs::copy_options::overwrite_existing, copy_ec);
+            }
+            lastExportPath_ = QString::fromStdString(out_path.string());
+        } else {
+            lastExportPath_ = QString::fromStdString(
+                wres.avproj_path.empty() ? wres.bundle_json_path : wres.avproj_path);
+        }
+
+        exportStatus_ = QString("Exported %1 (%2 stations, %3 floors, %4 KB E57) -> %5")
+            .arg(QString::fromStdString(core::processing::PointCloudProcessor::exportFormatName(fmt)))
+            .arg(wres.station_count)
+            .arg(wres.floor_count)
+            .arg(wres.e57_size_bytes / 1024)
+            .arg(lastExportPath_);
+        emit exportStateChanged();
+        emit notification("Export Complete", exportStatus_);
+        return lastExportPath_;
     }
 
     auto res = core::processing::PointCloudProcessor::exportPointCloud(
@@ -4851,6 +5296,86 @@ QString QmlBridge::exportActivePointCloud(const QString& formatStr,
 
     emit exportStateChanged();
     emit notification("Export Complete", exportStatus_);
+    return lastExportPath_;
+}
+
+void QmlBridge::dropFlashStationAnchor(const QString& label) {
+    core::processing::FlashStationAnchor anchor;
+    const size_t idx = flashAnchors_.size() + 1;
+    std::ostringstream id_ss;
+    id_ss << "flash_" << std::setfill('0') << std::setw(3) << idx;
+    anchor.anchor_id = id_ss.str();
+    anchor.label = label.trimmed().isEmpty()
+        ? ("Flash Station " + std::to_string(idx))
+        : label.trimmed().toStdString();
+    anchor.position = {
+        static_cast<double>(currentPoseX_),
+        static_cast<double>(currentPoseY_),
+        static_cast<double>(currentPoseZ_)
+    };
+    anchor.yaw_rad = static_cast<double>(currentYaw_) * M_PI / 180.0;
+    anchor.z_is_sensor_height = true;
+    flashAnchors_.push_back(anchor);
+    emit flashAnchorsChanged();
+    emit notification("Flash Station Dropped",
+                      QString("%1 pinned at (%2, %3, %4)m")
+                          .arg(QString::fromStdString(anchor.label))
+                          .arg(anchor.position.x, 0, 'f', 2)
+                          .arg(anchor.position.y, 0, 'f', 2)
+                          .arg(anchor.position.z, 0, 'f', 2));
+}
+
+void QmlBridge::clearFlashStationAnchors() {
+    flashAnchors_.clear();
+    emit flashAnchorsChanged();
+}
+
+QString QmlBridge::exportWalkthroughBundle(const QString& customOutputDir,
+                                           const QString& scanDate,
+                                           bool updateProjectAvproj) {
+    if (mapPoints_.empty()) {
+        emit errorOccurred("Walkthrough Export Error", "No active point cloud available to export.");
+        return "";
+    }
+
+    fs::path base_dir = storage_ ? fs::path(storage_->getRootDirectory()) : fs::current_path();
+    std::string pid = projectId_.isEmpty() ? "workspace" : projectId_.toStdString();
+    fs::path out_dir = customOutputDir.trimmed().isEmpty()
+        ? (base_dir / "projects" / pid / "exports" /
+           (pid + "_walkthrough_" + std::to_string(QDateTime::currentSecsSinceEpoch())))
+        : fs::path(customOutputDir.trimmed().toStdString());
+
+    core::processing::WalkthroughExportConfig wcfg;
+    wcfg.export_e57 = true;
+    wcfg.project_id = pid;
+    wcfg.project_name = projectName_.isEmpty() ? pid : projectName_.toStdString();
+    wcfg.scan_id = currentSessionId_.isEmpty()
+        ? ("scan_" + std::to_string(QDateTime::currentSecsSinceEpoch()))
+        : currentSessionId_.toStdString();
+    wcfg.scan_date = scanDate.trimmed().isEmpty()
+        ? QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd").toStdString()
+        : scanDate.trimmed().toStdString();
+    if (updateProjectAvproj) {
+        wcfg.av_showcase_project_dir = (base_dir / "projects" / pid / "av_showcase").string();
+    }
+
+    auto wres = core::processing::StructuredWalkthroughExporter::exportWalkthroughBundle(
+        out_dir.string(), mapPoints_, trajectory_, flashAnchors_, {}, wcfg, nullptr);
+    if (!wres.success) {
+        exportStatus_ = "Walkthrough export failed: " + QString::fromStdString(wres.error_message);
+        emit exportStateChanged();
+        emit errorOccurred("Walkthrough Export Failed", exportStatus_);
+        return "";
+    }
+
+    lastExportPath_ = QString::fromStdString(
+        wres.avproj_path.empty() ? wres.bundle_json_path : wres.avproj_path);
+    exportStatus_ = QString("Exported AV Walkthrough (%1 stations, %2 floors) -> %3")
+        .arg(wres.station_count)
+        .arg(wres.floor_count)
+        .arg(lastExportPath_);
+    emit exportStateChanged();
+    emit notification("AV Walkthrough Ready", exportStatus_);
     return lastExportPath_;
 }
 

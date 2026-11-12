@@ -37,6 +37,7 @@ add_library(av_core STATIC
     schemas/registration_result.cpp
     registration/registration_engine.cpp
     processing/point_cloud_processor.cpp
+    processing/structured_walkthrough_exporter.cpp
     fusion/extrinsic_calibrator.cpp
     fusion/multi_sensor_fusion_engine.cpp
 )
@@ -50,6 +51,8 @@ target_link_libraries(av_core PUBLIC
     nlohmann_json
     stdc++fs
     ${PCL_LIBRARIES}
+    JPEG::JPEG
+    ZLIB::ZLIB
 )
 
 if(TARGET Eigen3::Eigen)

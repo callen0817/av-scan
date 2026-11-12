@@ -15,7 +15,9 @@ enum class ExportFormat {
     PCD_ASCII,
     PCD_BINARY,
     XYZ_ASCII,
-    OBJ_MESH
+    OBJ_MESH,
+    E57_STRUCTURED,
+    AV_WALKTHROUGH_BUNDLE
 };
 
 struct GroundPlaneResult {

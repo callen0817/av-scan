@@ -27,6 +27,7 @@
 #include "core/schemas/registration_result.hpp"
 #include "core/registration/registration_engine.hpp"
 #include "core/processing/point_cloud_processor.hpp"
+#include "core/processing/structured_walkthrough_exporter.hpp"
 #include "core/fusion/extrinsic_calibrator.hpp"
 #include "core/fusion/multi_sensor_fusion_engine.hpp"
 
@@ -161,6 +162,10 @@ class QmlBridge : public QObject {
     Q_PROPERTY(QString discoveryStatusText READ discoveryStatusText NOTIFY discoveryStatusTextChanged)
     Q_PROPERTY(int discoveredDeviceCount READ discoveredDeviceCount NOTIFY discoveredDevicesChanged)
     Q_PROPERTY(int unprofiledDeviceCount READ unprofiledDeviceCount NOTIFY discoveredDevicesChanged)
+    Q_PROPERTY(bool autoDetectHardware READ autoDetectHardware WRITE setAutoDetectHardware NOTIFY autoDetectStateChanged)
+    Q_PROPERTY(QString autoDetectSummary READ autoDetectSummary NOTIFY autoDetectStateChanged)
+    Q_PROPERTY(bool hasPendingUnprofiledPrompt READ hasPendingUnprofiledPrompt NOTIFY pendingUnprofiledChanged)
+    Q_PROPERTY(QVariantMap pendingUnprofiledDevice READ pendingUnprofiledDevice NOTIFY pendingUnprofiledChanged)
 
     // 3D Viewport Camera Properties
     Q_PROPERTY(qreal camYaw3D READ camYaw3D NOTIFY cam3DChanged)
@@ -244,6 +249,7 @@ class QmlBridge : public QObject {
     Q_PROPERTY(qreal liveCleanupTimeMs READ liveCleanupTimeMs NOTIFY cleanupStateChanged)
     Q_PROPERTY(QString lastExportPath READ lastExportPath NOTIFY exportStateChanged)
     Q_PROPERTY(QString exportStatus READ exportStatus NOTIFY exportStateChanged)
+    Q_PROPERTY(int flashAnchorCount READ flashAnchorCount NOTIFY flashAnchorsChanged)
 
     // Milestones 7 & 8: Rigid Extrinsic Calibration & Multi-Sensor Spatial Fusion
     Q_PROPERTY(QString extrinsicCalibrationStatus READ extrinsicCalibrationStatus NOTIFY fusionStateChanged)
@@ -373,6 +379,11 @@ public:
     QString discoveryStatusText() const { return discoveryStatusText_; }
     int discoveredDeviceCount() const { return discoveredDeviceCount_; }
     int unprofiledDeviceCount() const { return unprofiledDeviceCount_; }
+    bool autoDetectHardware() const { return autoDetectHardware_; }
+    void setAutoDetectHardware(bool enabled);
+    QString autoDetectSummary() const { return autoDetectSummary_; }
+    bool hasPendingUnprofiledPrompt() const { return hasPendingUnprofiledPrompt_; }
+    QVariantMap pendingUnprofiledDevice() const { return pendingUnprofiledDevice_; }
 
     // Getters: Universal Sensor Ecosystem & Catalog (Milestone 14.5)
     int ecosystemModelCount() const;
@@ -462,6 +473,7 @@ public:
     qreal liveCleanupTimeMs() const { return liveCleanupTimeMs_; }
     QString lastExportPath() const { return lastExportPath_; }
     QString exportStatus() const { return exportStatus_; }
+    int flashAnchorCount() const { return static_cast<int>(flashAnchors_.size()); }
 
     // Getters: Milestones 7 & 8 Extrinsic Calibration & Multi-Sensor Fusion
     QString extrinsicCalibrationStatus() const { return extrinsicCalibrationStatus_; }
@@ -496,7 +508,17 @@ public:
     Q_INVOKABLE QVariantList discoverHardwareDevices();
     Q_INVOKABLE void refreshDiscovery();
     Q_INVOKABLE QVariantMap createProfileForDevice(const QString& deviceId);
+    Q_INVOKABLE QVariantMap confirmAndCreateProfileForDevice(const QString& deviceId,
+                                                             const QString& customName = "",
+                                                             const QString& customFamily = "",
+                                                             const QString& customSlamFamily = "",
+                                                             const QString& customSlamBackend = "",
+                                                             bool autoSelect = true);
     Q_INVOKABLE void selectProfileForCapture(const QString& profileId);
+    Q_INVOKABLE void triggerAutoDetectNow();
+    Q_INVOKABLE void selectScannerManual(int index);
+    Q_INVOKABLE void dismissUnprofiledDevicePrompt(const QString& deviceId = "");
+    Q_INVOKABLE void promptUnprofiledDevice(const QString& deviceId = "");
 
     // Q_INVOKABLE: Universal Sensor Ecosystem & Catalog (Milestone 14.5)
     Q_INVOKABLE QStringList getEcosystemManufacturers() const;
@@ -577,6 +599,11 @@ public:
     Q_INVOKABLE QString exportActivePointCloud(const QString& formatStr,
                                                const QString& customOutputPath = "",
                                                double meshGridResM = 0.04);
+    Q_INVOKABLE void dropFlashStationAnchor(const QString& label = "");
+    Q_INVOKABLE void clearFlashStationAnchors();
+    Q_INVOKABLE QString exportWalkthroughBundle(const QString& customOutputDir = "",
+                                                const QString& scanDate = "",
+                                                bool updateProjectAvproj = true);
 
     // Q_INVOKABLE: Milestones 7 & 8 Extrinsic Calibration & Multi-Sensor Spatial Fusion
     Q_INVOKABLE bool calibrateActiveScannerExtrinsics();
@@ -594,6 +621,7 @@ public:
 signals:
     void cleanupStateChanged();
     void exportStateChanged();
+    void flashAnchorsChanged();
     void fusionStateChanged();
     void registrationStateChanged();
     void registrationListChanged();
@@ -642,6 +670,9 @@ signals:
     void discoveredDevicesChanged();
     void isDiscoveringChanged();
     void discoveryStatusTextChanged();
+    void autoDetectStateChanged();
+    void pendingUnprofiledChanged();
+    void unprofiledDeviceDetected(const QVariantMap& deviceInfo);
     void ecosystemChanged();
     void nodeIdentityChanged();
     void multiNodeSessionChanged();
@@ -655,10 +686,12 @@ signals:
 private slots:
     void onTimerTick();
     void onTelemetryTick();
+    void onHotplugPollTick();
 
 private:
     void rebuildActiveSensorsForSelection();
     void updateLiveMultiSensorFusion(bool realTimeMode = true);
+    std::string computeHardwareTopologyFingerprint() const;
     void invalidateDisplayPointsCache() const { displayPointsCacheValid_ = false; }
 
     std::shared_ptr<core::storage::StorageEngine> storage_;
@@ -791,6 +824,13 @@ private:
     QString discoveryStatusText_{"Ready to scan interfaces."};
     int discoveredDeviceCount_{0};
     int unprofiledDeviceCount_{0};
+    QTimer* hotplugTimer_{nullptr};
+    std::string lastHardwareTopologyFingerprint_;
+    bool autoDetectHardware_{true};
+    QString autoDetectSummary_{"Auto-Detect Active"};
+    bool hasPendingUnprofiledPrompt_{false};
+    QVariantMap pendingUnprofiledDevice_;
+    QStringList dismissedUnprofiledDeviceIds_;
 
     // Camera Neural Reconstruction Backend State (Milestone 14.6)
     QString selectedCameraBackend_{"LingBotStreamingBackend"};
@@ -831,7 +871,8 @@ private:
     qreal liveCleanupTimeMs_{0.0};
     std::vector<core::schemas::PointXYZI> preCleanupBackupPoints_;
     QString lastExportPath_{""};
-    QString exportStatus_{"Ready to export (.ply, .pcd, .xyz, .obj)."};
+    QString exportStatus_{"Ready to export (.ply, .pcd, .xyz, .obj, .e57, .avproj)."};
+    std::vector<core::processing::FlashStationAnchor> flashAnchors_;
 
     // Milestones 7 & 8: Rigid Extrinsic Calibration & Multi-Sensor Spatial Fusion State
     QString extrinsicCalibrationStatus_{"UNKNOWN"};
