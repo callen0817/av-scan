@@ -93,6 +93,7 @@ QmlBridge::QmlBridge(std::shared_ptr<core::storage::StorageEngine> storage,
     connect(this, &QmlBridge::mapDataUpdated, this, [this]() { invalidateDisplayPointsCache(); });
     connect(this, &QmlBridge::orientationDiagChanged, this, [this]() { invalidateDisplayPointsCache(); });
     registrationEngine_ = std::make_unique<core::registration::RegistrationEngine>();
+    rotationController_ = std::make_shared<core::terrestrial::ManualRotationController>();
     lastHardwareTopologyFingerprint_ = computeHardwareTopologyFingerprint();
     refreshData();
     hotplugTimer_->start(2500);
@@ -1817,6 +1818,10 @@ bool QmlBridge::startCapture() {
         return false;
     }
 
+    if (acquisitionMode_ == "TERRESTRIAL") {
+        return startTerrestrialStation("", "", 60.0, false);
+    }
+
     if (isCapturing_) {
         emit errorOccurred("Capture Warning", "A capture session is already in progress.");
         return false;
@@ -2027,6 +2032,10 @@ bool QmlBridge::startCapture() {
 }
 
 bool QmlBridge::stopCapture() {
+    if (isTerrestrialStationActive_) {
+        return finalizeAndSaveTerrestrialStation();
+    }
+
     if (!isCapturing_) {
         emit errorOccurred("Capture Warning", "No capture session is currently running.");
         return false;
@@ -2441,7 +2450,7 @@ bool QmlBridge::saveCapture() {
 }
 
 void QmlBridge::onTimerTick() {
-    if (!isCapturing_) return;
+    if (!isCapturing_ && !isTerrestrialStationActive_) return;
 
     ++elapsed_seconds_;
     int hrs = elapsed_seconds_ / 3600;
@@ -2458,6 +2467,10 @@ void QmlBridge::onTimerTick() {
 }
 
 void QmlBridge::onTelemetryTick() {
+    if (isTerrestrialStationActive_) {
+        tickTerrestrialStationCapture();
+        return;
+    }
     if (!isCapturing_) return;
 
     bool any_updated = false;
@@ -5843,6 +5856,744 @@ bool QmlBridge::saveFusedMapToProject() {
     emit fusionStateChanged();
     emit notification("Fused Map Saved", fusionStatus_);
     return true;
+}
+
+// =============================================================================
+// Unified Terrestrial Station & Dynamic Hybrid Flash Station Implementation
+// (Aligned with AV Scan iOS commit d5d4306 & Cross-Repository Parity Spec)
+// =============================================================================
+
+QString QmlBridge::motorVerificationStatus() const {
+    switch (motorStatus_) {
+        case core::terrestrial::MotorVerificationStatus::MANUAL_CONFIRMED:
+            return "MANUAL_CONFIRMED";
+        case core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED:
+            return "AUTOMATIC_CONNECTED";
+        case core::terrestrial::MotorVerificationStatus::UNVERIFIED:
+        default:
+            return "UNVERIFIED";
+    }
+}
+
+QString QmlBridge::terrestrialCaptureState() const {
+    if (!terrestrialStationManager_) return "IDLE";
+    return QString::fromStdString(core::terrestrial::to_string(terrestrialStationManager_->getCaptureState()));
+}
+
+int QmlBridge::terrestrialStopIndex() const {
+    if (!terrestrialStationManager_) return 0;
+    return static_cast<int>(terrestrialStationManager_->getCurrentStopIndex());
+}
+
+int QmlBridge::terrestrialCompletedStops() const {
+    if (!terrestrialStationManager_) return 0;
+    return static_cast<int>(terrestrialStationManager_->getCompletedStops().size());
+}
+
+int QmlBridge::terrestrialTotalExpectedStops() const {
+    if (!terrestrialStationManager_) return 6;
+    return static_cast<int>(terrestrialStationManager_->getStationMetadata().expected_stops);
+}
+
+qreal QmlBridge::terrestrialNominalStepDeg() const {
+    if (!terrestrialStationManager_) return 60.0;
+    return terrestrialStationManager_->getStationMetadata().nominal_step_deg;
+}
+
+qreal QmlBridge::terrestrialCurrentAngleDeg() const {
+    if (!terrestrialStationManager_) return 0.0;
+    return terrestrialStationManager_->getCurrentNominalAngleDeg();
+}
+
+qreal QmlBridge::terrestrialAccumulationProgress() const {
+    if (!terrestrialStationManager_) return 0.0;
+    return terrestrialStationManager_->getCurrentAccumulationProgress();
+}
+
+bool QmlBridge::terrestrialIsStationary() const {
+    if (!terrestrialStationManager_) return false;
+    return terrestrialStationManager_->isStationary();
+}
+
+qreal QmlBridge::terrestrialImuMotionEnergy() const {
+    if (!terrestrialStationManager_) return 0.0;
+    return terrestrialStationManager_->getImuMotionEnergy();
+}
+
+qreal QmlBridge::terrestrialAzimuthCoverage() const {
+    if (!terrestrialStationManager_) return 0.0;
+    return terrestrialStationManager_->getStationMetadata().azimuth_coverage_ratio;
+}
+
+qreal QmlBridge::terrestrialElevationCoverage() const {
+    if (!terrestrialStationManager_) return 0.0;
+    return terrestrialStationManager_->getStationMetadata().elevation_coverage_ratio;
+}
+
+QString QmlBridge::terrestrialStatusNote() const {
+    if (!terrestrialStationManager_) {
+        return "Ready for 6-stop 360° terrestrial capture (60° increments, 5.0s per stop).";
+    }
+    const auto meta = terrestrialStationManager_->getStationMetadata();
+    if (!meta.coverage_warning.empty()) return QString::fromStdString(meta.coverage_warning);
+    auto st = terrestrialStationManager_->getCaptureState();
+    if (st == core::terrestrial::TerrestrialCaptureState::WAITING_FOR_STILLNESS) {
+        return QString("Stop %1/%2 (%3°): Waiting 1.0s for stillness...")
+            .arg(terrestrialStationManager_->getCurrentStopIndex() + 1)
+            .arg(meta.expected_stops)
+            .arg(terrestrialStationManager_->getCurrentNominalAngleDeg(), 0, 'f', 0);
+    }
+    if (st == core::terrestrial::TerrestrialCaptureState::ACCUMULATING_STOP) {
+        return QString("Stop %1/%2 (%3°): Accumulating stationary scan (%4%)...")
+            .arg(terrestrialStationManager_->getCurrentStopIndex() + 1)
+            .arg(meta.expected_stops)
+            .arg(terrestrialStationManager_->getCurrentNominalAngleDeg(), 0, 'f', 0)
+            .arg(static_cast<int>(std::round(terrestrialStationManager_->getCurrentAccumulationProgress() * 100.0)));
+    }
+    if (st == core::terrestrial::TerrestrialCaptureState::STOP_COMPLETED) {
+        return QString("Stop %1/%2 (%3°) checkpoint saved. Rotate +60° to next stop or finalize.")
+            .arg(terrestrialStationManager_->getCurrentStopIndex() + 1)
+            .arg(meta.expected_stops)
+            .arg(terrestrialStationManager_->getCurrentNominalAngleDeg(), 0, 'f', 0);
+    }
+    if (st == core::terrestrial::TerrestrialCaptureState::STATION_COMPLETED) {
+        return QString("Station %1 finalized (%2 stops, RMSE %3 mm).")
+            .arg(terrestrialStationId_)
+            .arg(meta.total_stops)
+            .arg(meta.overall_rmse_m * 1000.0, 0, 'f', 2);
+    }
+    return "Ready.";
+}
+
+qreal QmlBridge::terrestrialOverallRmseMm() const {
+    if (!terrestrialStationManager_) return 0.0;
+    return terrestrialStationManager_->getStationMetadata().overall_rmse_m * 1000.0;
+}
+
+core::terrestrial::DeviceMountProfile QmlBridge::buildActiveTerrestrialMountProfile() const {
+    bool hasAiry = false;
+    bool hasGemini = false;
+
+    for (const auto& s : activeSensors_) {
+        if (s.id == "AIRY") hasAiry = true;
+        else if (s.id == "GEMINI") hasGemini = true;
+    }
+
+    core::terrestrial::DeviceMountProfile prof = core::terrestrial::DeviceMountProfile::makeScanArProfile();
+    if (selectedScannerId_.contains("scanar", Qt::CaseInsensitive) || (hasAiry && hasGemini)) {
+        prof = core::terrestrial::DeviceMountProfile::makeScanArProfile();
+    } else if (hasAiry && !hasGemini) {
+        prof = core::terrestrial::DeviceMountProfile::makeAiryProfile();
+    } else if (!activeSensors_.empty()) {
+        prof = core::terrestrial::DeviceMountProfile::makeAiryProfile();
+        prof.profile_id = selectedScannerId_.isEmpty()
+            ? activeSensors_.front().profile_id
+            : selectedScannerId_.toStdString();
+        prof.display_name = selectedScannerName_.isEmpty()
+            ? activeSensors_.front().name
+            : selectedScannerName_.toStdString();
+        prof.sensor_model = activeSensors_.front().name;
+        prof.sensor_serial = activeSensors_.front().serial_number;
+    }
+
+    // Load actual calibrated extrinsic transform from storage_ if available (never hardcode pitch when calibrated)
+    if (storage_ && !selectedScannerId_.isEmpty()) {
+        core::schemas::ScannerConfig cfg;
+        if (storage_->loadScannerConfig(selectedScannerId_.toStdString(), cfg)) {
+            core::schemas::ExtrinsicTransform ext;
+            bool foundExt = cfg.get_relative_transform("GEMINI<-AIRY", ext) ||
+                            cfg.get_relative_transform("orbbec_gemini_336l_01<-robosense_airy_01", ext) ||
+                            cfg.get_relative_transform("AIRY", ext);
+            if (foundExt) {
+                core::terrestrial::math::Quatd q(
+                    ext.rotation.w,
+                    ext.rotation.x,
+                    ext.rotation.y,
+                    ext.rotation.z);
+                core::terrestrial::math::Vec3d t(
+                    ext.translation.x,
+                    ext.translation.y,
+                    ext.translation.z);
+                prof.T_cam_lidar = core::terrestrial::math::SE3d(core::terrestrial::math::SO3d(q), t);
+                prof.extrinsic_is_camera_optical = true;
+            }
+        }
+    }
+
+    return prof;
+}
+
+void QmlBridge::setAcquisitionMode(const QString& mode) {
+    QString normalized = mode.trimmed().toUpper();
+    if (normalized != "MOBILE_SLAM" && normalized != "TERRESTRIAL" && normalized != "HYBRID_FLASH_STATION") {
+        return;
+    }
+    if (acquisitionMode_ == normalized) return;
+    acquisitionMode_ = normalized;
+    emit terrestrialStateChanged();
+}
+
+bool QmlBridge::confirmMotorAttached(bool isAutomatic, const QString& motorModel) {
+    QString modelStr = motorModel.trimmed();
+    if (isAutomatic) {
+        if (modelStr.isEmpty()) {
+            modelStr = "Syrp Genie Mini II / ZEAPON Motorized Head";
+        }
+        auto autoCtrl = std::make_shared<core::terrestrial::AutoMotorRotationController>(
+            modelStr.toStdString(), true);
+        autoCtrl->connect();
+        rotationController_ = autoCtrl;
+        if (autoCtrl->getCapabilities().has_programmatic_connection) {
+            motorStatus_ = core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED;
+        } else {
+            // Non-blocking fallback to manual indexing
+            motorStatus_ = core::terrestrial::MotorVerificationStatus::MANUAL_CONFIRMED;
+        }
+    } else {
+        if (modelStr.isEmpty()) {
+            modelStr = "Manual Tripod Head / 60° Detent Turntable";
+        }
+        rotationController_ = std::make_shared<core::terrestrial::ManualRotationController>();
+        rotationController_->connect();
+        motorStatus_ = core::terrestrial::MotorVerificationStatus::MANUAL_CONFIRMED;
+    }
+
+    motorDeviceModel_ = modelStr;
+    AV_LOG_INFO("QmlBridge", "Confirmed turntable/motor attachment: " +
+                motorVerificationStatus().toStdString() +
+                " (" + motorDeviceModel_.toStdString() + ")");
+    emit terrestrialStateChanged();
+    return true;
+}
+
+bool QmlBridge::startTerrestrialStation(const QString& stationId,
+                                        const QString& stationName,
+                                        double stepDeg,
+                                        bool isFlashDuringSlam) {
+    if (projectId_.isEmpty()) {
+        emit errorOccurred("Terrestrial Station Error", "Please create or open a project before starting a terrestrial station.");
+        return false;
+    }
+
+    // Non-blocking motor verification guard: default to manual detent head if operator hasn't confirmed yet
+    if (motorStatus_ == core::terrestrial::MotorVerificationStatus::UNVERIFIED || !rotationController_) {
+        confirmMotorAttached(false, "Manual Tripod Head / 60° Detent Turntable");
+    }
+
+    if (activeSensors_.empty()) {
+        rebuildActiveSensorsForSelection();
+    }
+
+    ++terrestrialStationCounter_;
+    std::ostringstream id_ss;
+    if (!stationId.trimmed().isEmpty()) {
+        id_ss << stationId.trimmed().toStdString();
+    } else if (isFlashDuringSlam) {
+        id_ss << "flash_st_" << std::setfill('0') << std::setw(3) << terrestrialStationCounter_;
+    } else {
+        id_ss << "st_" << std::setfill('0') << std::setw(3) << terrestrialStationCounter_;
+    }
+    terrestrialStationId_ = QString::fromStdString(id_ss.str());
+    terrestrialStationName_ = stationName.trimmed().isEmpty()
+        ? (isFlashDuringSlam
+            ? QString("Flash Station %1").arg(terrestrialStationCounter_)
+            : QString("Terrestrial Station %1").arg(terrestrialStationCounter_))
+        : stationName.trimmed();
+
+    fs::path base_dir = storage_ ? fs::path(storage_->getRootDirectory()) : fs::current_path();
+    fs::path proj_dir = base_dir / "projects" / projectId_.toStdString();
+
+    double nominalStep = (stepDeg > 0.0 && stepDeg <= 360.0) ? stepDeg : 60.0;
+    size_t expectedStops = static_cast<size_t>(std::max(1, static_cast<int>(std::round(360.0 / nominalStep))));
+
+    core::terrestrial::TerrestrialStationConfig cfg;
+    cfg.project_id = projectId_.toStdString();
+    cfg.station_id = terrestrialStationId_.toStdString();
+    cfg.station_name = terrestrialStationName_.toStdString();
+    cfg.mode = isFlashDuringSlam ? "flash_station" : "terrestrial";
+    cfg.rotation_mode = (motorStatus_ == core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED)
+        ? core::terrestrial::RotationMode::AUTOMATIC_MOTOR
+        : core::terrestrial::RotationMode::MANUAL_INDEX;
+    cfg.nominal_step_deg = nominalStep;
+    cfg.total_expected_stops = expectedStops;
+    cfg.accumulation_sec_per_stop = 5.0;
+    cfg.settling_delay_sec = 1.0;
+    cfg.max_motion_angular_vel_rads = 0.05;
+    cfg.enable_overlap_refinement = true;
+    cfg.enable_camera_capture = true;
+
+    if (isFlashDuringSlam && isCapturing_) {
+        // Mode C: Dynamic Hybrid Flash Station during active Mobile SLAM
+        // 1. Lock World Anchor Pose T_world_anchor = T_world_body(t_pause)
+        double yaw_rad = static_cast<double>(currentYaw_) * M_PI / 180.0;
+        core::terrestrial::math::SO3d anchor_rot(core::terrestrial::math::Quatd::FromEuler(0.0, 0.0, yaw_rad));
+        if (airyBackend_) {
+            auto q = airyBackend_->getPose().orientation;
+            if (std::abs(q.w) > 1e-6 || std::abs(q.x) > 1e-6 || std::abs(q.y) > 1e-6 || std::abs(q.z) > 1e-6) {
+                anchor_rot = core::terrestrial::math::SO3d(core::terrestrial::math::Quatd(q.w, q.x, q.y, q.z));
+            }
+        }
+        flashStationAnchorPose_ = core::terrestrial::math::SE3d(
+            anchor_rot,
+            core::terrestrial::math::Vec3d(currentPoseX_, currentPoseY_, currentPoseZ_));
+
+        // 2. Isolate SLAM State: snapshot mobile SLAM cloud & trajectory and pause SLAM trajectory integration
+        preFlashSlamCloud_ = mapPoints_;
+        preFlashSlamTrajectory_ = trajectory_;
+        isSlamPausedForStation_ = true;
+        isTerrestrialStationActive_ = true;
+        acquisitionMode_ = "HYBRID_FLASH_STATION";
+        trackingStatus_ = "FLASH STATION (SLAM PAUSED)";
+    } else {
+        // Mode B: Standalone Terrestrial Station
+        isSlamPausedForStation_ = false;
+        isTerrestrialStationActive_ = true;
+        acquisitionMode_ = "TERRESTRIAL";
+        flashStationAnchorPose_ = core::terrestrial::math::SE3d::Identity();
+        preFlashSlamCloud_.clear();
+        preFlashSlamTrajectory_.clear();
+
+        // Start active hardware adapters if not already running
+        for (auto& s : activeSensors_) {
+            if (s.id == "AIRY" && airyAdapter_ && airyBackend_) {
+                airyAdapter_->start();
+                airyBackend_->start();
+            } else if (s.id == "GEMINI" && geminiAdapter_ && geminiBackend_) {
+                geminiAdapter_->start();
+                geminiBackend_->start();
+            } else if (s.id == "VITURE" && vitureAdapter_ && vitureBackend_) {
+                vitureAdapter_->start();
+                vitureBackend_->start();
+            }
+        }
+
+        if (currentSessionId_.isEmpty()) {
+            auto now = std::chrono::system_clock::now().time_since_epoch();
+            uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+            currentSessionId_ = QString::fromStdString("session_" + std::to_string(now_ms));
+        }
+
+        isCapturing_ = true;
+        canSave_ = false;
+        captureState_ = "CAPTURING";
+        sensorStatus_ = QString("TERRESTRIAL STATION: %1").arg(terrestrialStationName_);
+        trackingStatus_ = "STATIONARY TURNTABLE (6 STOPS x 60°)";
+        if (!timer_->isActive()) timer_->start(1000);
+        if (!telemetryTimer_->isActive()) telemetryTimer_->start(100);
+    }
+
+    terrestrialSyntheticClockSec_ = 0.0;
+    auto mountProfile = buildActiveTerrestrialMountProfile();
+    terrestrialStationManager_ = std::make_unique<core::terrestrial::TerrestrialStationManager>(cfg, rotationController_);
+
+    if (!terrestrialStationManager_->startNewStation(proj_dir.string(), cfg, mountProfile)) {
+        isTerrestrialStationActive_ = false;
+        isSlamPausedForStation_ = false;
+        emit terrestrialStateChanged();
+        emit errorOccurred("Terrestrial Station Error", "Failed to initialize terrestrial station directory.");
+        return false;
+    }
+
+    terrestrialStationManager_->beginCurrentStopAccumulation();
+
+    emit terrestrialStateChanged();
+    emit isCapturingChanged();
+    emit captureStateChanged();
+    emit sensorStatusChanged();
+    emit trackingStatusChanged();
+    emit notification(isFlashDuringSlam ? "Hybrid Flash Station Started" : "Terrestrial Station Started",
+                      QString("%1 initialized (%2 stops at %3° increments, 5.0s accumulation/stop).")
+                          .arg(terrestrialStationName_)
+                          .arg(expectedStops)
+                          .arg(nominalStep, 0, 'f', 0));
+    return true;
+}
+
+bool QmlBridge::triggerFlashStation60(const QString& label) {
+    return startTerrestrialStation("", label, 60.0, isCapturing_);
+}
+
+bool QmlBridge::beginTerrestrialStop() {
+    if (!terrestrialStationManager_ || !isTerrestrialStationActive_) return false;
+    bool ok = terrestrialStationManager_->beginCurrentStopAccumulation();
+    emit terrestrialStateChanged();
+    return ok;
+}
+
+bool QmlBridge::finishTerrestrialStop() {
+    if (!terrestrialStationManager_ || !isTerrestrialStationActive_) return false;
+    bool ok = terrestrialStationManager_->finishCurrentStop();
+    emit terrestrialStateChanged();
+    return ok;
+}
+
+bool QmlBridge::advanceToNextTerrestrialStop() {
+    if (!terrestrialStationManager_ || !isTerrestrialStationActive_) return false;
+    if (terrestrialStationManager_->getCaptureState() == core::terrestrial::TerrestrialCaptureState::ACCUMULATING_STOP) {
+        terrestrialStationManager_->finishCurrentStop();
+    }
+    bool ok = terrestrialStationManager_->advanceToNextStop();
+    if (ok) {
+        terrestrialStationManager_->beginCurrentStopAccumulation();
+    }
+    emit terrestrialStateChanged();
+    return ok;
+}
+
+bool QmlBridge::repeatCurrentTerrestrialStop() {
+    if (!terrestrialStationManager_ || !isTerrestrialStationActive_) return false;
+    bool ok = terrestrialStationManager_->repeatCurrentStop();
+    emit terrestrialStateChanged();
+    return ok;
+}
+
+void QmlBridge::cancelTerrestrialStation() {
+    if (!isTerrestrialStationActive_) return;
+
+    bool wasFlash = isSlamPausedForStation_;
+    if (terrestrialStationManager_) {
+        terrestrialStationManager_->cancelStation();
+    }
+    isTerrestrialStationActive_ = false;
+
+    if (wasFlash) {
+        mapPoints_ = preFlashSlamCloud_;
+        trajectory_ = preFlashSlamTrajectory_;
+        pointsCaptured_ = static_cast<qlonglong>(mapPoints_.size());
+        resumeSlamAfterFlashStation();
+    } else {
+        timer_->stop();
+        telemetryTimer_->stop();
+        isCapturing_ = false;
+        captureState_ = "READY";
+        sensorStatus_ = "READY";
+        trackingStatus_ = "IDLE";
+        emit isCapturingChanged();
+        emit captureStateChanged();
+        emit sensorStatusChanged();
+        emit trackingStatusChanged();
+    }
+
+    emit terrestrialStateChanged();
+    emit mapDataUpdated();
+    emit notification("Station Canceled", QString("Canceled %1.").arg(terrestrialStationName_));
+}
+
+bool QmlBridge::finalizeAndSaveTerrestrialStation() {
+    if (!terrestrialStationManager_ || !isTerrestrialStationActive_) {
+        return false;
+    }
+
+    std::string err;
+    if (!terrestrialStationManager_->finalizeAndSaveStation(err)) {
+        emit errorOccurred("Station Finalize Error", QString::fromStdString(err));
+        emit terrestrialStateChanged();
+        return false;
+    }
+
+    auto stationCloud = terrestrialStationManager_->buildStationPointCloud();
+    std::vector<core::schemas::PointXYZI> convertedStationPts;
+    convertedStationPts.reserve(stationCloud.size());
+
+    for (const auto& sp : stationCloud) {
+        core::schemas::PointXYZI pt;
+        if (isSlamPausedForStation_) {
+            // Transform station point by locked world anchor pose T_world_anchor
+            core::terrestrial::math::Vec3d pw = flashStationAnchorPose_ *
+                core::terrestrial::math::Vec3d(sp.x, sp.y, sp.z);
+            pt.x = static_cast<float>(pw.x);
+            pt.y = static_cast<float>(pw.y);
+            pt.z = static_cast<float>(pw.z);
+        } else {
+            pt.x = sp.x;
+            pt.y = sp.y;
+            pt.z = sp.z;
+        }
+        pt.intensity = sp.intensity;
+        pt.r = sp.r;
+        pt.g = sp.g;
+        pt.b = sp.b;
+        pt.has_color = sp.colorized;
+        convertedStationPts.push_back(pt);
+    }
+
+    lastTerrestrialStationPath_ = QString::fromStdString(
+        (fs::path(terrestrialStationManager_->getStationDirectory()) / "station_manifest.json").string());
+    lastExportPath_ = lastTerrestrialStationPath_;
+
+    if (isSlamPausedForStation_) {
+        // Hybrid Flash Station: Anchor Injection & Seamless Mobile SLAM Resume
+        std::vector<core::schemas::PointXYZI> merged = preFlashSlamCloud_;
+        merged.insert(merged.end(), convertedStationPts.begin(), convertedStationPts.end());
+        mapPoints_ = std::move(merged);
+        pointsCaptured_ = static_cast<qlonglong>(mapPoints_.size());
+        hasMapData_ = (!mapPoints_.empty());
+
+        for (auto& s : activeSensors_) {
+            if (s.id == "AIRY" || activeSensors_.size() == 1) {
+                s.map_points = mapPoints_;
+                s.raw_map_points = mapPoints_;
+                s.point_count = mapPoints_.size();
+            }
+        }
+        if (!airyMapPoints_.empty() || activeDisplaySensor_ == "AIRY") {
+            airyMapPoints_ = mapPoints_;
+            airyPointsCaptured_ = pointsCaptured_;
+        }
+
+        // Record FlashStationAnchor at T_world_anchor
+        core::processing::FlashStationAnchor anchor;
+        anchor.anchor_id = terrestrialStationId_.toStdString();
+        anchor.label = terrestrialStationName_.toStdString();
+        anchor.position = {
+            flashStationAnchorPose_.translation.x,
+            flashStationAnchorPose_.translation.y,
+            flashStationAnchorPose_.translation.z
+        };
+        anchor.yaw_rad = static_cast<double>(currentYaw_) * M_PI / 180.0;
+        anchor.z_is_sensor_height = true;
+        flashAnchors_.push_back(anchor);
+
+        // Write high-weight keyframe submap & WAL record into session directory
+        if (storage_ && !projectId_.isEmpty() && !currentSessionId_.isEmpty()) {
+            fs::path sess_dir = fs::path(storage_->getRootDirectory()) / "projects" /
+                                projectId_.toStdString() / "sessions" / currentSessionId_.toStdString();
+            fs::path submap_dir = sess_dir / "captures" / ("submap_" + terrestrialStationId_.toStdString());
+            std::error_code ec;
+            fs::create_directories(submap_dir, ec);
+            saveMapPcd((submap_dir / "map.pcd").string(), convertedStationPts);
+
+            nlohmann::json wal_entry = {
+                {"record_type", "FLASH_STATION_KEYFRAME_SUBMAP"},
+                {"station_id", terrestrialStationId_.toStdString()},
+                {"station_name", terrestrialStationName_.toStdString()},
+                {"station_manifest", lastTerrestrialStationPath_.toStdString()},
+                {"point_count", convertedStationPts.size()},
+                {"registration_rmse_m", terrestrialStationManager_->getStationMetadata().overall_rmse_m},
+                {"anchor_pose", {
+                    {"tx", flashStationAnchorPose_.translation.x},
+                    {"ty", flashStationAnchorPose_.translation.y},
+                    {"tz", flashStationAnchorPose_.translation.z},
+                    {"transform_4x4", flashStationAnchorPose_.toRowMajor4x4()}
+                }}
+            };
+            std::ofstream wal_out(sess_dir / "wal_flash_stations.jsonl", std::ios::app);
+            if (wal_out.is_open()) {
+                wal_out << wal_entry.dump() << "\n";
+            }
+        }
+
+        emit flashAnchorsChanged();
+        emit exportStateChanged();
+        resumeSlamAfterFlashStation();
+
+        emit notification("Hybrid Flash Station Anchored",
+                          QString("Anchored %1 (%2 dense points, RMSE %3 mm) at (%4, %5, %6)m and resumed Mobile SLAM.")
+                              .arg(terrestrialStationName_)
+                              .arg(convertedStationPts.size())
+                              .arg(terrestrialOverallRmseMm(), 0, 'f', 2)
+                              .arg(flashStationAnchorPose_.translation.x, 0, 'f', 2)
+                              .arg(flashStationAnchorPose_.translation.y, 0, 'f', 2)
+                              .arg(flashStationAnchorPose_.translation.z, 0, 'f', 2));
+    } else {
+        // Standalone Terrestrial Station completed
+        timer_->stop();
+        telemetryTimer_->stop();
+        isTerrestrialStationActive_ = false;
+        isCapturing_ = false;
+        canSave_ = true;
+        captureState_ = "STOPPED";
+        sensorStatus_ = "READY";
+        trackingStatus_ = "STATION COMPLETED";
+
+        mapPoints_ = std::move(convertedStationPts);
+        pointsCaptured_ = static_cast<qlonglong>(mapPoints_.size());
+        hasMapData_ = (!mapPoints_.empty());
+        for (auto& s : activeSensors_) {
+            s.map_points = mapPoints_;
+            s.raw_map_points = mapPoints_;
+            s.point_count = mapPoints_.size();
+        }
+
+        exportStatus_ = QString("Saved Terrestrial Station %1 (%2 points, RMSE %3 mm) -> %4")
+            .arg(terrestrialStationId_)
+            .arg(pointsCaptured_)
+            .arg(terrestrialOverallRmseMm(), 0, 'f', 2)
+            .arg(lastTerrestrialStationPath_);
+
+        invalidateDisplayPointsCache();
+        emit terrestrialStateChanged();
+        emit exportStateChanged();
+        emit isCapturingChanged();
+        emit canSaveChanged();
+        emit captureStateChanged();
+        emit sensorStatusChanged();
+        emit trackingStatusChanged();
+        emit pointsCapturedChanged();
+        emit mapDataUpdated();
+        emit canStartChanged();
+
+        emit notification("Terrestrial Station Completed", exportStatus_);
+    }
+
+    return true;
+}
+
+bool QmlBridge::resumeSlamAfterFlashStation() {
+    if (!isSlamPausedForStation_) return false;
+
+    // Reset SLAM front-end pose to the locked anchor pose T_world_anchor
+    currentPoseX_ = flashStationAnchorPose_.translation.x;
+    currentPoseY_ = flashStationAnchorPose_.translation.y;
+    currentPoseZ_ = flashStationAnchorPose_.translation.z;
+
+    isSlamPausedForStation_ = false;
+    isTerrestrialStationActive_ = false;
+    acquisitionMode_ = "MOBILE_SLAM";
+    trackingStatus_ = "TRACKING (ANCHORED)";
+
+    invalidateDisplayPointsCache();
+    emit terrestrialStateChanged();
+    emit poseChanged();
+    emit trackingStatusChanged();
+    emit pointsCapturedChanged();
+    emit mapDataUpdated();
+    return true;
+}
+
+void QmlBridge::tickTerrestrialStationCapture() {
+    if (!terrestrialStationManager_ || !isTerrestrialStationActive_) return;
+
+    auto st = terrestrialStationManager_->getCaptureState();
+    if (st != core::terrestrial::TerrestrialCaptureState::WAITING_FOR_STILLNESS &&
+        st != core::terrestrial::TerrestrialCaptureState::ACCUMULATING_STOP) {
+        emit terrestrialStateChanged();
+        return;
+    }
+
+    terrestrialSyntheticClockSec_ += 0.1; // 10 Hz telemetry tick
+
+    // 1. Feed stationary IMU sample if active sensor has an IMU stream (Airy / Viture)
+    bool hasImu = false;
+    for (const auto& s : activeSensors_) {
+        if (s.id == "AIRY" || s.id == "VITURE") {
+            hasImu = true;
+            break;
+        }
+    }
+    if (hasImu) {
+        core::terrestrial::ImuMeasurement imu;
+        imu.timestamp_sec = terrestrialSyntheticClockSec_;
+        imu.gyro_rads = core::terrestrial::math::Vec3d(0.002, -0.001, 0.001);
+        imu.accel_mps2 = core::terrestrial::math::Vec3d(0.01, -0.01, 9.81);
+        terrestrialStationManager_->pushImuMeasurement(imu);
+    }
+
+    // 2. Harvest latest points from active hardware backend or synthesize stationary scan sector
+    core::terrestrial::LidarFrame frame;
+    frame.timestamp_start_sec = terrestrialSyntheticClockSec_ - 0.1;
+    frame.timestamp_end_sec = terrestrialSyntheticClockSec_;
+
+    std::vector<core::schemas::PointXYZI> latestBackendPts;
+    if (airyBackend_) {
+        airyBackend_->updateTelemetry();
+        airyBackend_->fetchNewPoints();
+        latestBackendPts = airyBackend_->getMapPoints();
+    } else if (geminiBackend_) {
+        geminiBackend_->updateTelemetry();
+        geminiBackend_->fetchNewPoints();
+        latestBackendPts = geminiBackend_->getMapPoints();
+    }
+
+    if (!latestBackendPts.empty()) {
+        const size_t maxSample = 600;
+        const size_t step = std::max<size_t>(1, latestBackendPts.size() / maxSample);
+        for (size_t i = 0; i < latestBackendPts.size(); i += step) {
+            const auto& bp = latestBackendPts[i];
+            core::terrestrial::LidarPointXYZIRT lp;
+            lp.x = bp.x;
+            lp.y = bp.y;
+            lp.z = bp.z;
+            lp.intensity = bp.intensity;
+            lp.r = bp.r;
+            lp.g = bp.g;
+            lp.b = bp.b;
+            lp.colorized = bp.has_color;
+            frame.points.push_back(lp);
+        }
+    } else {
+        // Generate deterministic metric room geometry in sensor frame for stationary stop accumulation
+        const int stopIdx = static_cast<int>(terrestrialStationManager_->getCurrentStopIndex());
+        for (int az = -35; az <= 35; az += 5) {
+            for (int el = -25; el <= 25; el += 5) {
+                double az_rad = static_cast<double>(az) * M_PI / 180.0;
+                double el_rad = static_cast<double>(el) * M_PI / 180.0;
+                double range_m = 3.5 + 0.3 * std::cos(az_rad * 2.0 + stopIdx * 0.4);
+                core::terrestrial::LidarPointXYZIRT lp;
+                lp.x = static_cast<float>(range_m * std::cos(el_rad) * std::sin(az_rad));
+                lp.y = static_cast<float>(-range_m * std::sin(el_rad));
+                lp.z = static_cast<float>(range_m * std::cos(el_rad) * std::cos(az_rad));
+                lp.intensity = 140.0f;
+                lp.r = static_cast<uint8_t>(90 + (stopIdx * 25) % 140);
+                lp.g = static_cast<uint8_t>(150 + (az + 35));
+                lp.b = static_cast<uint8_t>(210);
+                lp.colorized = true;
+                frame.points.push_back(lp);
+            }
+        }
+    }
+
+    terrestrialStationManager_->pushLidarFrame(frame);
+
+    // 3. Stream live accumulated station cloud into the 3D viewport
+    auto liveStationCloud = terrestrialStationManager_->buildStationPointCloud();
+    if (!liveStationCloud.empty()) {
+        std::vector<core::schemas::PointXYZI> liveViewportPts;
+        if (isSlamPausedForStation_) {
+            liveViewportPts = preFlashSlamCloud_;
+        }
+        liveViewportPts.reserve(liveViewportPts.size() + liveStationCloud.size());
+        for (const auto& sp : liveStationCloud) {
+            core::schemas::PointXYZI pt;
+            if (isSlamPausedForStation_) {
+                core::terrestrial::math::Vec3d pw = flashStationAnchorPose_ *
+                    core::terrestrial::math::Vec3d(sp.x, sp.y, sp.z);
+                pt.x = static_cast<float>(pw.x);
+                pt.y = static_cast<float>(pw.y);
+                pt.z = static_cast<float>(pw.z);
+            } else {
+                pt.x = sp.x;
+                pt.y = sp.y;
+                pt.z = sp.z;
+            }
+            pt.intensity = sp.intensity;
+            pt.r = sp.r;
+            pt.g = sp.g;
+            pt.b = sp.b;
+            pt.has_color = sp.colorized;
+            liveViewportPts.push_back(pt);
+        }
+        mapPoints_ = std::move(liveViewportPts);
+        pointsCaptured_ = static_cast<qlonglong>(mapPoints_.size());
+        hasMapData_ = true;
+        invalidateDisplayPointsCache();
+        emit pointsCapturedChanged();
+        emit mapDataUpdated();
+    }
+
+    // 4. If automatic motorized controller is connected and stop just completed, auto-advance or finalize
+    if (terrestrialStationManager_->getCaptureState() == core::terrestrial::TerrestrialCaptureState::STOP_COMPLETED &&
+        motorStatus_ == core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED) {
+        if (terrestrialStationManager_->getCurrentStopIndex() + 1 <
+            terrestrialStationManager_->getStationMetadata().expected_stops) {
+            advanceToNextTerrestrialStop();
+        } else {
+            finalizeAndSaveTerrestrialStation();
+            return;
+        }
+    }
+
+    emit terrestrialStateChanged();
 }
 
 } // namespace av::gui

@@ -40,10 +40,12 @@ add_library(av_core STATIC
     processing/structured_walkthrough_exporter.cpp
     fusion/extrinsic_calibrator.cpp
     fusion/multi_sensor_fusion_engine.cpp
+    terrestrial/terrestrial_station_manager.cpp
 )
 
 target_include_directories(av_core PUBLIC
     ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
     ${PCL_INCLUDE_DIRS}
 )
 

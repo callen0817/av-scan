@@ -30,6 +30,7 @@
 #include "core/processing/structured_walkthrough_exporter.hpp"
 #include "core/fusion/extrinsic_calibrator.hpp"
 #include "core/fusion/multi_sensor_fusion_engine.hpp"
+#include "core/terrestrial/terrestrial_station_manager.hpp"
 
 namespace av::gui {
 
@@ -267,6 +268,32 @@ class QmlBridge : public QObject {
     Q_PROPERTY(bool isAnchorFailoverActive READ isAnchorFailoverActive NOTIFY fusionStateChanged)
     Q_PROPERTY(qreal activeAnchorScore READ activeAnchorScore NOTIFY fusionStateChanged)
 
+    // Unified Terrestrial Station & Dynamic Hybrid Flash Station Properties (AV Cross-Repository Parity)
+    Q_PROPERTY(QString acquisitionMode READ acquisitionMode WRITE setAcquisitionMode NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(bool isTerrestrialMode READ isTerrestrialMode NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(bool isTerrestrialStationActive READ isTerrestrialStationActive NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(bool isFlashStationActive READ isFlashStationActive NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(bool isSlamPausedForStation READ isSlamPausedForStation NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString motorVerificationStatus READ motorVerificationStatus NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString motorDeviceModel READ motorDeviceModel NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString terrestrialCaptureState READ terrestrialCaptureState NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(int terrestrialStopIndex READ terrestrialStopIndex NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(int terrestrialCompletedStops READ terrestrialCompletedStops NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(int terrestrialTotalExpectedStops READ terrestrialTotalExpectedStops NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialNominalStepDeg READ terrestrialNominalStepDeg NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialCurrentAngleDeg READ terrestrialCurrentAngleDeg NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialAccumulationProgress READ terrestrialAccumulationProgress NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(bool terrestrialIsStationary READ terrestrialIsStationary NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString terrestrialStillnessStatus READ terrestrialStillnessStatus NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialImuMotionEnergy READ terrestrialImuMotionEnergy NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialAzimuthCoverage READ terrestrialAzimuthCoverage NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialElevationCoverage READ terrestrialElevationCoverage NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString terrestrialStatusNote READ terrestrialStatusNote NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(qreal terrestrialOverallRmseMm READ terrestrialOverallRmseMm NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString terrestrialStationId READ terrestrialStationId NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString terrestrialStationName READ terrestrialStationName NOTIFY terrestrialStateChanged)
+    Q_PROPERTY(QString lastTerrestrialStationPath READ lastTerrestrialStationPath NOTIFY terrestrialStateChanged)
+
 public:
     explicit QmlBridge(std::shared_ptr<core::storage::StorageEngine> storage,
                        std::shared_ptr<platform::IPlatformAdapter> platform,
@@ -491,6 +518,32 @@ public:
     bool isAnchorFailoverActive() const { return isAnchorFailoverActive_; }
     qreal activeAnchorScore() const { return activeAnchorScore_; }
 
+    // Getters: Unified Terrestrial & Hybrid Flash Station
+    QString acquisitionMode() const { return acquisitionMode_; }
+    bool isTerrestrialMode() const { return acquisitionMode_ == "TERRESTRIAL"; }
+    bool isTerrestrialStationActive() const { return isTerrestrialStationActive_; }
+    bool isFlashStationActive() const { return isTerrestrialStationActive_ && isSlamPausedForStation_; }
+    bool isSlamPausedForStation() const { return isSlamPausedForStation_; }
+    QString motorVerificationStatus() const;
+    QString motorDeviceModel() const { return motorDeviceModel_; }
+    QString terrestrialCaptureState() const;
+    int terrestrialStopIndex() const;
+    int terrestrialCompletedStops() const;
+    int terrestrialTotalExpectedStops() const;
+    qreal terrestrialNominalStepDeg() const;
+    qreal terrestrialCurrentAngleDeg() const;
+    qreal terrestrialAccumulationProgress() const;
+    bool terrestrialIsStationary() const;
+    QString terrestrialStillnessStatus() const { return terrestrialIsStationary() ? "YES" : "SETTLING"; }
+    qreal terrestrialImuMotionEnergy() const;
+    qreal terrestrialAzimuthCoverage() const;
+    qreal terrestrialElevationCoverage() const;
+    QString terrestrialStatusNote() const;
+    qreal terrestrialOverallRmseMm() const;
+    QString terrestrialStationId() const { return terrestrialStationId_; }
+    QString terrestrialStationName() const { return terrestrialStationName_; }
+    QString lastTerrestrialStationPath() const { return lastTerrestrialStationPath_; }
+
     // Q_INVOKABLE: Project Operations
     Q_INVOKABLE bool createProject(const QString& name, const QString& description);
     Q_INVOKABLE bool openProject(const QString& projectId);
@@ -531,6 +584,22 @@ public:
     Q_INVOKABLE bool startCapture();
     Q_INVOKABLE bool stopCapture();
     Q_INVOKABLE bool saveCapture();
+
+    // Q_INVOKABLE: Unified Terrestrial Station & Dynamic Hybrid Flash Station Operations
+    Q_INVOKABLE void setAcquisitionMode(const QString& mode);
+    Q_INVOKABLE bool confirmMotorAttached(bool isAutomatic, const QString& motorModel = "");
+    Q_INVOKABLE bool startTerrestrialStation(const QString& stationId = "",
+                                             const QString& stationName = "",
+                                             double stepDeg = 60.0,
+                                             bool isFlashDuringSlam = false);
+    Q_INVOKABLE bool triggerFlashStation60(const QString& label = "");
+    Q_INVOKABLE bool beginTerrestrialStop();
+    Q_INVOKABLE bool finishTerrestrialStop();
+    Q_INVOKABLE bool advanceToNextTerrestrialStop();
+    Q_INVOKABLE bool repeatCurrentTerrestrialStop();
+    Q_INVOKABLE void cancelTerrestrialStation();
+    Q_INVOKABLE bool finalizeAndSaveTerrestrialStation();
+    Q_INVOKABLE bool resumeSlamAfterFlashStation();
 
     // Q_INVOKABLE: 3D and 2D Geometry Access
     Q_INVOKABLE QVariantList getDisplayPoints(int maxPoints = 8000) const;
@@ -619,6 +688,7 @@ public:
     bool loadMapPcd(const std::string& filepath, std::vector<core::schemas::PointXYZI>& out_points);
 
 signals:
+    void terrestrialStateChanged();
     void cleanupStateChanged();
     void exportStateChanged();
     void flashAnchorsChanged();
@@ -691,6 +761,8 @@ private slots:
 private:
     void rebuildActiveSensorsForSelection();
     void updateLiveMultiSensorFusion(bool realTimeMode = true);
+    core::terrestrial::DeviceMountProfile buildActiveTerrestrialMountProfile() const;
+    void tickTerrestrialStationCapture();
     std::string computeHardwareTopologyFingerprint() const;
     void invalidateDisplayPointsCache() const { displayPointsCacheValid_ = false; }
 
@@ -890,6 +962,23 @@ private:
     QString activeAnchorRationale_{"Highest nominal metric accuracy (LiDAR + IMU)."};
     bool isAnchorFailoverActive_{false};
     qreal activeAnchorScore_{100.0};
+
+    // Unified Terrestrial Station & Dynamic Hybrid Flash Station State
+    std::unique_ptr<core::terrestrial::TerrestrialStationManager> terrestrialStationManager_;
+    std::shared_ptr<core::terrestrial::IRotationController> rotationController_;
+    core::terrestrial::MotorVerificationStatus motorStatus_{core::terrestrial::MotorVerificationStatus::UNVERIFIED};
+    QString motorDeviceModel_{"Manual Tripod Head / Turntable Detent"};
+    QString acquisitionMode_{"MOBILE_SLAM"};
+    bool isTerrestrialStationActive_{false};
+    bool isSlamPausedForStation_{false};
+    core::terrestrial::math::SE3d flashStationAnchorPose_{core::terrestrial::math::SE3d::Identity()};
+    std::vector<core::schemas::PointXYZI> preFlashSlamCloud_;
+    std::vector<core::schemas::Pose3D> preFlashSlamTrajectory_;
+    QString terrestrialStationId_{""};
+    QString terrestrialStationName_{""};
+    QString lastTerrestrialStationPath_{""};
+    int terrestrialStationCounter_{0};
+    double terrestrialSyntheticClockSec_{0.0};
 };
 
 } // namespace av::gui

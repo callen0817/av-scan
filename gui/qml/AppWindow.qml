@@ -1922,16 +1922,96 @@ ApplicationWindow {
                     }
                 }
 
-                // 1. Primary Action: ▶ START SCAN (matches scanarMini start_btn)
+                // 0b. Operational Mode Selector: [Mobile SLAM | Terrestrial]
+                Rectangle {
+                    id: modeSelectorPill
+                    implicitHeight: 34
+                    implicitWidth: 168
+                    radius: 9
+                    color: "#12FFFFFF"
+                    border.color: "#47BAA164"
+                    border.width: 1
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.margins: 2
+                        spacing: 2
+
+                        Button {
+                            id: modeMobileSlamBtn
+                            text: "Mobile SLAM"
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            enabled: !bridge.isTerrestrialStationActive
+                            onClicked: bridge.setAcquisitionMode("MOBILE_SLAM")
+                            contentItem: Text {
+                                text: modeMobileSlamBtn.text
+                                color: !bridge.isTerrestrialMode ? "#090A0D" : root.avWhiteWarm
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 7
+                                color: !bridge.isTerrestrialMode ? root.avGoldPrimary : "transparent"
+                            }
+                        }
+
+                        Button {
+                            id: modeTerrestrialBtn
+                            text: "Terrestrial"
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            enabled: !bridge.isCapturing || bridge.isTerrestrialMode
+                            onClicked: {
+                                bridge.setAcquisitionMode("TERRESTRIAL");
+                                if (bridge.motorVerificationStatus === "UNVERIFIED") {
+                                    motorConfirmDialog.pendingFlashMode = false;
+                                    motorConfirmDialog.pendingStartImmediately = false;
+                                    motorConfirmDialog.open();
+                                }
+                            }
+                            contentItem: Text {
+                                text: modeTerrestrialBtn.text
+                                color: bridge.isTerrestrialMode ? "#090A0D" : root.avWhiteWarm
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 7
+                                color: bridge.isTerrestrialMode ? root.avGoldPrimary : "transparent"
+                            }
+                        }
+                    }
+                }
+
+                // 1. Primary Action: ▶ START SCAN / ▶ START STATION (matches scanarMini start_btn)
                 Button {
                     id: startBtn
-                    text: bridge.isCapturing ? "● SCANNING..." : "▶ START SCAN"
-                    enabled: !bridge.isCapturing
+                    text: bridge.isTerrestrialStationActive
+                        ? "● STATION ACTIVE"
+                        : (bridge.isCapturing
+                            ? "● SCANNING..."
+                            : (bridge.isTerrestrialMode ? "▶ START STATION" : "▶ START SCAN"))
+                    enabled: !bridge.isCapturing && !bridge.isTerrestrialStationActive
                     implicitHeight: 34
-                    implicitWidth: 116
+                    implicitWidth: 118
                     onClicked: {
                         root.ensureActiveProjectOpen();
-                        bridge.startCapture();
+                        if (bridge.isTerrestrialMode) {
+                            if (bridge.motorVerificationStatus === "UNVERIFIED") {
+                                motorConfirmDialog.pendingFlashMode = false;
+                                motorConfirmDialog.pendingStartImmediately = true;
+                                motorConfirmDialog.open();
+                            } else {
+                                bridge.startTerrestrialStation("", "", 60.0, false);
+                            }
+                        } else {
+                            bridge.startCapture();
+                        }
                     }
                     contentItem: Text {
                         text: startBtn.text
@@ -1953,8 +2033,8 @@ ApplicationWindow {
                 // 2. Primary Action: ■ STOP (matches scanarMini stop_btn)
                 Button {
                     id: stopBtn
-                    text: "■ STOP"
-                    enabled: bridge.isCapturing
+                    text: bridge.isTerrestrialStationActive ? "■ FINISH" : "■ STOP"
+                    enabled: bridge.isCapturing || bridge.isTerrestrialStationActive
                     implicitHeight: 34
                     implicitWidth: 74
                     onClicked: bridge.stopCapture()
@@ -1970,6 +2050,41 @@ ApplicationWindow {
                         radius: 9
                         color: !stopBtn.enabled ? "#0AFFFFFF" : (stopBtn.hovered ? "#4DEF4444" : "#29EF4444")
                         border.color: stopBtn.enabled ? "#8CF87171" : "#1FFFFFFF"
+                        border.width: 1
+                    }
+                }
+
+                // 2b. Dynamic Hybrid "Flash 60°" Station Trigger during Active SLAM
+                Button {
+                    id: flashStation60Btn
+                    text: bridge.isFlashStationActive ? "⚡ FLASH ACTIVE" : "⚡ Flash 60°"
+                    enabled: !bridge.isTerrestrialStationActive
+                    implicitHeight: 34
+                    implicitWidth: 96
+                    onClicked: {
+                        root.ensureActiveProjectOpen();
+                        if (bridge.motorVerificationStatus === "UNVERIFIED") {
+                            motorConfirmDialog.pendingFlashMode = true;
+                            motorConfirmDialog.pendingStartImmediately = true;
+                            motorConfirmDialog.open();
+                        } else {
+                            bridge.triggerFlashStation60("");
+                        }
+                    }
+                    contentItem: Text {
+                        text: flashStation60Btn.text
+                        color: bridge.isFlashStationActive ? "#090A0D" : root.avGoldBright
+                        font.pixelSize: 11
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 9
+                        color: bridge.isFlashStationActive
+                            ? root.avGoldBright
+                            : (flashStation60Btn.hovered ? "#3DBAA164" : "#1FBAA164")
+                        border.color: root.avGoldPrimary
                         border.width: 1
                     }
                 }
@@ -2372,9 +2487,13 @@ ApplicationWindow {
                             anchors.right: parent.right
                             anchors.rightMargin: 10
                             anchors.verticalCenter: parent.verticalCenter
-                            text: bridge.isCapturing
-                                ? ("STAGE 2  ·  ACTIVE SPATIAL CAPTURE — Walking AR Passthrough Active  ·  Anchor: " + (bridge.activeAnchorSensor || "AIRY"))
-                                : "STAGE 1  ·  Place scanner static on flat surface, then press 'START SCAN'"
+                            text: bridge.isTerrestrialStationActive
+                                ? ("TERRESTRIAL STATION  ·  " + bridge.terrestrialStatusNote)
+                                : (bridge.isCapturing
+                                    ? ("STAGE 2  ·  ACTIVE SPATIAL CAPTURE — Walking AR Passthrough Active  ·  Anchor: " + (bridge.activeAnchorSensor || "AIRY"))
+                                    : (bridge.isTerrestrialMode
+                                        ? ("TERRESTRIAL MODE  ·  6 Stops x 60° (5.0s/stop)  ·  Head: " + bridge.motorDeviceModel)
+                                        : "STAGE 1  ·  Place scanner static on flat surface, then press 'START SCAN'"))
                             color: root.avGoldBright
                             font.pixelSize: 12
                             font.weight: Font.DemiBold
@@ -2390,10 +2509,220 @@ ApplicationWindow {
                         color: "#1FFFFFFF"
 
                         Rectangle {
-                            width: parent.width * (bridge.isCapturing ? 1.0 : ((bridge.projectName !== "" && bridge.projectName !== "No Active Project") ? 0.35 : 0.08))
+                            width: parent.width * (bridge.isTerrestrialStationActive
+                                ? bridge.terrestrialAccumulationProgress
+                                : (bridge.isCapturing ? 1.0 : ((bridge.projectName !== "" && bridge.projectName !== "No Active Project") ? 0.35 : 0.08)))
                             height: parent.height
                             radius: 2.5
                             color: root.avGoldPrimary
+                        }
+                    }
+                }
+
+                // Real-Time Terrestrial Station & Hybrid Flash Station HUD Banner
+                Rectangle {
+                    id: terrestrialHudStrip
+                    visible: bridge.isTerrestrialMode || bridge.isTerrestrialStationActive
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 40
+                    radius: 8
+                    color: "#1F12151C"
+                    border.color: bridge.isFlashStationActive ? root.avGoldBright : "#7ABAA164"
+                    border.width: 1
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 8
+
+                        // Stop X/6 + Angle badge
+                        Rectangle {
+                            implicitHeight: 26
+                            implicitWidth: 126
+                            radius: 6
+                            color: "#2EBAA164"
+                            border.color: root.avGoldPrimary
+                            border.width: 1
+                            Text {
+                                anchors.centerIn: parent
+                                text: "STOP " + (bridge.terrestrialStopIndex + 1) + "/" + bridge.terrestrialTotalExpectedStops +
+                                      " (" + Math.round(bridge.terrestrialCurrentAngleDeg) + "°)"
+                                color: root.avGoldBright
+                                font.pixelSize: 11
+                                font.bold: true
+                                font.family: "Monospace"
+                            }
+                        }
+
+                        // Dual-Criterion IMU Stillness Gate Indicator (YES vs SETTLING)
+                        Rectangle {
+                            implicitHeight: 26
+                            implicitWidth: 108
+                            radius: 6
+                            color: bridge.terrestrialIsStationary ? "#1F10B981" : "#26F59E0B"
+                            border.color: bridge.terrestrialIsStationary ? "#34D399" : "#FBBF24"
+                            border.width: 1
+                            Text {
+                                anchors.centerIn: parent
+                                text: "STILL: " + bridge.terrestrialStillnessStatus
+                                color: bridge.terrestrialIsStationary ? "#6EE7B7" : "#FDE68A"
+                                font.pixelSize: 10
+                                font.bold: true
+                                font.family: "Monospace"
+                            }
+                        }
+
+                        // 5.0-Second Stop Accumulation Progress Bar (0% - 100%)
+                        Rectangle {
+                            Layout.preferredWidth: 128
+                            implicitHeight: 24
+                            radius: 6
+                            color: "#14FFFFFF"
+                            border.color: "#38FFFFFF"
+                            border.width: 1
+
+                            Rectangle {
+                                width: parent.width * Math.max(0.0, Math.min(1.0, bridge.terrestrialAccumulationProgress))
+                                height: parent.height
+                                radius: 6
+                                color: "#66BAA164"
+                            }
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "5.0s ACCUM: " + Math.round(bridge.terrestrialAccumulationProgress * 100) + "%"
+                                color: root.avWhiteWarm
+                                font.pixelSize: 10
+                                font.bold: true
+                                font.family: "Monospace"
+                            }
+                        }
+
+                        // Azimuth & Elevation Coverage Readout
+                        Text {
+                            text: "AZ: " + Math.round(bridge.terrestrialAzimuthCoverage * 100) + "% | EL: " + Math.round(bridge.terrestrialElevationCoverage * 100) + "%"
+                            color: root.avWhiteMuted
+                            font.pixelSize: 10
+                            font.family: "Monospace"
+                            font.bold: true
+                        }
+
+                        Item { Layout.fillWidth: true }
+
+                        // Interactive Turntable & Station Controls
+                        Button {
+                            text: "⚙ Head"
+                            implicitHeight: 26
+                            implicitWidth: 58
+                            onClicked: {
+                                motorConfirmDialog.pendingFlashMode = bridge.isFlashStationActive;
+                                motorConfirmDialog.pendingStartImmediately = false;
+                                motorConfirmDialog.open();
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: root.avGoldBright
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                color: "#19BAA164"
+                                border.color: "#6BBAA164"
+                                border.width: 1
+                            }
+                        }
+
+                        Button {
+                            text: "↻ Repeat"
+                            visible: bridge.isTerrestrialStationActive
+                            implicitHeight: 26
+                            implicitWidth: 64
+                            onClicked: bridge.repeatCurrentTerrestrialStop()
+                            contentItem: Text {
+                                text: parent.text
+                                color: root.avWhiteWarm
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                color: "#14FFFFFF"
+                                border.color: "#38FFFFFF"
+                                border.width: 1
+                            }
+                        }
+
+                        Button {
+                            text: "Next (+60°) →"
+                            visible: bridge.isTerrestrialStationActive
+                            enabled: bridge.terrestrialStopIndex + 1 < bridge.terrestrialTotalExpectedStops
+                            implicitHeight: 26
+                            implicitWidth: 92
+                            onClicked: bridge.advanceToNextTerrestrialStop()
+                            contentItem: Text {
+                                text: parent.text
+                                color: parent.enabled ? "#090A0D" : "#59FFFFFF"
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                color: parent.enabled ? root.avGoldPrimary : "#12FFFFFF"
+                                border.color: parent.enabled ? root.avGoldBright : "#24FFFFFF"
+                                border.width: 1
+                            }
+                        }
+
+                        Button {
+                            text: "✓ Finalize"
+                            visible: bridge.isTerrestrialStationActive
+                            implicitHeight: 26
+                            implicitWidth: 74
+                            onClicked: bridge.finalizeAndSaveTerrestrialStation()
+                            contentItem: Text {
+                                text: parent.text
+                                color: "#090A0D"
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                color: "#34D399"
+                                border.color: "#86EFAC"
+                                border.width: 1
+                            }
+                        }
+
+                        Button {
+                            text: "✕"
+                            visible: bridge.isTerrestrialStationActive
+                            implicitHeight: 26
+                            implicitWidth: 28
+                            onClicked: bridge.cancelTerrestrialStation()
+                            contentItem: Text {
+                                text: parent.text
+                                color: "#FCA5A5"
+                                font.pixelSize: 10
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                color: "#29EF4444"
+                                border.color: "#8CF87171"
+                                border.width: 1
+                            }
                         }
                     }
                 }
@@ -10387,6 +10716,173 @@ ApplicationWindow {
                         border.color: "#FFF3D1"
                         border.width: 1
                     }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // NON-BLOCKING MOTORIZED HEAD / TURNTABLE CONFIRMATION DIALOG
+    // (Aligned with AV Scan iOS commit d5d4306 & Cross-Repository Parity Spec)
+    // =========================================================================
+    Popup {
+        id: motorConfirmDialog
+        width: 560
+        height: 360
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        property bool pendingFlashMode: false
+        property bool pendingStartImmediately: false
+
+        background: Rectangle {
+            radius: 14
+            color: "#F2111318"
+            border.color: root.avGoldPrimary
+            border.width: 1.5
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 22
+            spacing: 14
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Text {
+                    text: motorConfirmDialog.pendingFlashMode
+                        ? "⚡ Hybrid Flash 60° Station — Turntable / Head Confirmation"
+                        : "📡 Terrestrial 360° Station — Turntable / Head Confirmation"
+                    color: root.avGoldBright
+                    font.pixelSize: 15
+                    font.bold: true
+                    Layout.fillWidth: true
+                }
+
+                Button {
+                    text: "✕"
+                    implicitWidth: 28
+                    implicitHeight: 28
+                    onClicked: motorConfirmDialog.close()
+                    contentItem: Text {
+                        text: parent.text
+                        color: root.avWhiteMuted
+                        font.pixelSize: 12
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1FFFFFFF"
+                    }
+                }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.avWhiteWarm
+                font.pixelSize: 12
+                text: "Verify your tripod rotation mount before starting 6-stop 360° acquisition (60° nominal increments: 0°, 60°, 120°, 180°, 240°, 300° with 5.0s stationary accumulation per stop and 1.0s IMU stillness gate)."
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                height: 64
+                radius: 8
+                color: "#14BAA164"
+                border.color: "#47BAA164"
+                border.width: 1
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    spacing: 4
+
+                    Text {
+                        text: "Current Head Status: " + bridge.motorVerificationStatus + " (" + bridge.motorDeviceModel + ")"
+                        color: root.avGoldBright
+                        font.pixelSize: 11
+                        font.bold: true
+                    }
+                    Text {
+                        text: "Cable Safety Guard: Enforces 360° max revolution and unwinds to 0° on completion."
+                        color: root.avWhiteMuted
+                        font.pixelSize: 10
+                    }
+                }
+            }
+
+            Item { Layout.fillHeight: true }
+
+            // Option 1: Confirm Manual / Detent Head Attached (Non-blocking)
+            Button {
+                id: btnConfirmManualHead
+                text: "✓ Confirm Manual / Detent Head Attached (60° Stops)"
+                Layout.fillWidth: true
+                implicitHeight: 42
+                onClicked: {
+                    bridge.confirmMotorAttached(false, "Manual Tripod Head / 60° Detent Turntable");
+                    motorConfirmDialog.close();
+                    if (motorConfirmDialog.pendingStartImmediately) {
+                        if (motorConfirmDialog.pendingFlashMode) {
+                            bridge.triggerFlashStation60("");
+                        } else {
+                            bridge.startTerrestrialStation("", "", 60.0, false);
+                        }
+                    }
+                }
+                contentItem: Text {
+                    text: btnConfirmManualHead.text
+                    color: "#090A0D"
+                    font.pixelSize: 12
+                    font.bold: true
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    radius: 9
+                    color: btnConfirmManualHead.hovered ? root.avGoldBright : root.avGoldPrimary
+                    border.color: "#FFF3D1"
+                    border.width: 1
+                }
+            }
+
+            // Option 2: Connect Auto Bluetooth / Serial Motor (With Automatic Fallback to Manual)
+            Button {
+                id: btnConnectAutoMotor
+                text: "⚡ Connect Auto Bluetooth / Serial Motor (Syrp Genie Mini / ZEAPON)"
+                Layout.fillWidth: true
+                implicitHeight: 42
+                onClicked: {
+                    bridge.confirmMotorAttached(true, "Syrp Genie Mini II / ZEAPON Motorized Head");
+                    motorConfirmDialog.close();
+                    if (motorConfirmDialog.pendingStartImmediately) {
+                        if (motorConfirmDialog.pendingFlashMode) {
+                            bridge.triggerFlashStation60("");
+                        } else {
+                            bridge.startTerrestrialStation("", "", 60.0, false);
+                        }
+                    }
+                }
+                contentItem: Text {
+                    text: btnConnectAutoMotor.text
+                    color: root.avGoldBright
+                    font.pixelSize: 12
+                    font.bold: true
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    radius: 9
+                    color: btnConnectAutoMotor.hovered ? "#3DBAA164" : "#1FBAA164"
+                    border.color: root.avGoldPrimary
+                    border.width: 1
                 }
             }
         }

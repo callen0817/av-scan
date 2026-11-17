@@ -275,5 +275,11 @@ target_link_libraries(test_walkthrough_interoperability PRIVATE
 )
 add_test(NAME test_walkthrough_interoperability COMMAND test_walkthrough_interoperability)
 
-
-
+add_executable(test_terrestrial_station unit/test_terrestrial_station.cpp)
+target_link_libraries(test_terrestrial_station PRIVATE
+    av_core
+    jpeg
+    z
+    pthread
+)
+add_test(NAME test_terrestrial_station COMMAND test_terrestrial_station)
