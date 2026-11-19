@@ -182,6 +182,49 @@ bool writePngGray8File(const std::string& path, const uint8_t* gray, int width, 
     return ofs.good();
 }
 
+bool writePngRgb8File(const std::string& path, const uint8_t* rgb, int width, int height) {
+    if (!rgb || width <= 0 || height <= 0) return false;
+    fs::path p(path);
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+    }
+
+    const size_t row_bytes = static_cast<size_t>(width) * 3;
+    std::vector<uint8_t> raw_scanlines;
+    raw_scanlines.reserve(static_cast<size_t>(height) * (1 + row_bytes));
+    for (int r = 0; r < height; ++r) {
+        raw_scanlines.push_back(0); // PNG filter type 0 (None)
+        const uint8_t* row = rgb + static_cast<size_t>(r) * row_bytes;
+        raw_scanlines.insert(raw_scanlines.end(), row, row + row_bytes);
+    }
+
+    uLongf comp_bound = compressBound(static_cast<uLong>(raw_scanlines.size()));
+    std::vector<uint8_t> zbuf(comp_bound);
+    if (compress2(zbuf.data(), &comp_bound, raw_scanlines.data(),
+                  static_cast<uLong>(raw_scanlines.size()), 6) != Z_OK) {
+        return false;
+    }
+
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<uint8_t> ihdr;
+    appendBe32(ihdr, static_cast<uint32_t>(width));
+    appendBe32(ihdr, static_cast<uint32_t>(height));
+    ihdr.push_back(8); // bit depth 8
+    ihdr.push_back(2); // color type 2 (Truecolor 24-bit RGB)
+    ihdr.push_back(0); // compression method 0 (deflate)
+    ihdr.push_back(0); // filter method 0
+    ihdr.push_back(0); // interlace method 0 (none)
+    writePngChunk(png, "IHDR", ihdr.data(), ihdr.size());
+    writePngChunk(png, "IDAT", zbuf.data(), static_cast<size_t>(comp_bound));
+    writePngChunk(png, "IEND", nullptr, 0);
+
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) return false;
+    ofs.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    return ofs.good();
+}
+
 } // anonymous namespace
 
 TerrestrialStationManager::TerrestrialStationManager(
@@ -236,12 +279,14 @@ bool TerrestrialStationManager::startNewStation(
     current_stop_rgb_pixels_.clear();
     current_stop_rgb_width_ = 0;
     current_stop_rgb_height_ = 0;
+    stop_rgb_captured_ = false;
 
     station_dir_ = (fs::path(project_dir_) / "stations" / config_.station_id).string();
     std::error_code ec;
     fs::create_directories(fs::path(station_dir_) / "raw" / "images", ec);
     fs::create_directories(fs::path(station_dir_) / "cache", ec);
     fs::create_directories(fs::path(station_dir_) / "pano", ec);
+    fs::create_directories(fs::path(station_dir_) / "floors", ec);
 
     state_ = TerrestrialCaptureState::WAITING_FOR_STILLNESS;
     rotation_ctrl_->setZeroPosition();
@@ -284,6 +329,11 @@ void TerrestrialStationManager::pushImuMeasurement(const ImuMeasurement& imu) {
             stillness_duration_sec_ = 0.0;
             stop_start_time_sec_ = 0.0;
             current_stop_points_.clear();
+            current_stop_image_path_.clear();
+            current_stop_rgb_pixels_.clear();
+            current_stop_rgb_width_ = 0;
+            current_stop_rgb_height_ = 0;
+            stop_rgb_captured_ = false;
         }
     }
 }
@@ -326,7 +376,10 @@ void TerrestrialStationManager::pushLidarFrame(const LidarFrame& frame) {
 
 void TerrestrialStationManager::pushCameraImage(const std::string& image_file_path) {
     std::lock_guard<std::mutex> lock(mutex_);
-    current_stop_image_path_ = image_file_path;
+    if (!image_file_path.empty()) {
+        current_stop_image_path_ = image_file_path;
+        stop_rgb_captured_ = true;
+    }
 }
 
 void TerrestrialStationManager::pushCameraRgbBuffer(const std::vector<uint8_t>& rgb_pixels, int width, int height) {
@@ -335,6 +388,7 @@ void TerrestrialStationManager::pushCameraRgbBuffer(const std::vector<uint8_t>& 
         current_stop_rgb_pixels_ = rgb_pixels;
         current_stop_rgb_width_ = width;
         current_stop_rgb_height_ = height;
+        stop_rgb_captured_ = true;
     }
 }
 
@@ -344,6 +398,11 @@ bool TerrestrialStationManager::beginCurrentStopAccumulation() {
     stillness_duration_sec_ = 0.0;
     stop_start_time_sec_ = 0.0;
     current_stop_points_.clear();
+    current_stop_image_path_.clear();
+    current_stop_rgb_pixels_.clear();
+    current_stop_rgb_width_ = 0;
+    current_stop_rgb_height_ = 0;
+    stop_rgb_captured_ = false;
     return true;
 }
 
@@ -445,6 +504,9 @@ bool TerrestrialStationManager::advanceToNextStop() {
     current_stop_points_.clear();
     current_stop_image_path_.clear();
     current_stop_rgb_pixels_.clear();
+    current_stop_rgb_width_ = 0;
+    current_stop_rgb_height_ = 0;
+    stop_rgb_captured_ = false;
     return true;
 }
 
@@ -457,6 +519,11 @@ bool TerrestrialStationManager::repeatCurrentStop() {
     stillness_duration_sec_ = 0.0;
     stop_start_time_sec_ = 0.0;
     current_stop_points_.clear();
+    current_stop_image_path_.clear();
+    current_stop_rgb_pixels_.clear();
+    current_stop_rgb_width_ = 0;
+    current_stop_rgb_height_ = 0;
+    stop_rgb_captured_ = false;
     return true;
 }
 
@@ -466,6 +533,11 @@ bool TerrestrialStationManager::cancelStation() {
     state_ = TerrestrialCaptureState::IDLE;
     stops_.clear();
     current_stop_points_.clear();
+    current_stop_image_path_.clear();
+    current_stop_rgb_pixels_.clear();
+    current_stop_rgb_width_ = 0;
+    current_stop_rgb_height_ = 0;
+    stop_rgb_captured_ = false;
     return true;
 }
 
@@ -736,6 +808,73 @@ bool TerrestrialStationManager::generatePanoramaAndCoverageMask(
     return ok_jpg && ok_png;
 }
 
+bool TerrestrialStationManager::generateFloorKeyplanPng(
+    const std::vector<LidarPointXYZIRT>& merged_station_points,
+    const std::string& keyplan_png_path,
+    int width,
+    int height) {
+    if (width <= 0 || height <= 0) return false;
+
+    // Dark slate architectural canvas (RGB24)
+    std::vector<uint8_t> canvas(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 0);
+    for (size_t i = 0; i < static_cast<size_t>(width) * static_cast<size_t>(height); ++i) {
+        canvas[i * 3 + 0] = 15;
+        canvas[i * 3 + 1] = 23;
+        canvas[i * 3 + 2] = 42;
+    }
+
+    // Determine XY bounds (minimum +/- 5.0m window around tripod origin)
+    double max_abs = 5.0;
+    for (const auto& pt : merged_station_points) {
+        max_abs = std::max(max_abs, std::max(std::abs(static_cast<double>(pt.x)),
+                                             std::abs(static_cast<double>(pt.y))));
+    }
+    const double span = max_abs * 2.15;
+    const double scale = static_cast<double>(std::min(width, height)) / span;
+    const double cx = static_cast<double>(width) * 0.5;
+    const double cy = static_cast<double>(height) * 0.5;
+
+    // Project points top-down (+X right/forward, +Y up/left)
+    for (const auto& pt : merged_station_points) {
+        int px = static_cast<int>(std::round(cx + static_cast<double>(pt.x) * scale));
+        int py = static_cast<int>(std::round(cy - static_cast<double>(pt.y) * scale));
+        if (px < 0 || px >= width || py < 0 || py >= height) continue;
+
+        uint8_t r = pt.colorized ? pt.r : 56;
+        uint8_t g = pt.colorized ? pt.g : 189;
+        uint8_t b = pt.colorized ? pt.b : 248;
+
+        for (int dy = -1; dy <= 1; ++dy) {
+            int yy = py + dy;
+            if (yy < 0 || yy >= height) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                int xx = px + dx;
+                if (xx < 0 || xx >= width) continue;
+                size_t idx = (static_cast<size_t>(yy) * static_cast<size_t>(width) + static_cast<size_t>(xx)) * 3;
+                canvas[idx + 0] = r;
+                canvas[idx + 1] = g;
+                canvas[idx + 2] = b;
+            }
+        }
+    }
+
+    // Draw station tripod origin crosshair at (cx, cy)
+    const int ox = static_cast<int>(std::round(cx));
+    const int oy = static_cast<int>(std::round(cy));
+    for (int d = -10; d <= 10; ++d) {
+        if (ox + d >= 0 && ox + d < width && oy >= 0 && oy < height) {
+            size_t idx = (static_cast<size_t>(oy) * static_cast<size_t>(width) + static_cast<size_t>(ox + d)) * 3;
+            canvas[idx + 0] = 16; canvas[idx + 1] = 185; canvas[idx + 2] = 129;
+        }
+        if (oy + d >= 0 && oy + d < height && ox >= 0 && ox < width) {
+            size_t idx = (static_cast<size_t>(oy + d) * static_cast<size_t>(width) + static_cast<size_t>(ox)) * 3;
+            canvas[idx + 0] = 16; canvas[idx + 1] = 185; canvas[idx + 2] = 129;
+        }
+    }
+
+    return writePngRgb8File(keyplan_png_path, canvas.data(), width, height);
+}
+
 bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_error) {
     if (station_dir_.empty()) {
         out_error = "Station directory path is not initialized.";
@@ -746,6 +885,7 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
     std::error_code ec;
     fs::create_directories(st_dir / "cache", ec);
     fs::create_directories(st_dir / "pano", ec);
+    fs::create_directories(st_dir / "floors", ec);
     fs::create_directories(st_dir / "raw" / "images", ec);
 
     // 1. Build merged station point cloud in Station Frame
@@ -756,12 +896,13 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
         }
     }
 
-    // 2. Write pointcloud.ply, station.e57, cache/lod0.bin, and pano/*
+    // 2. Write pointcloud.ply, station.e57, cache/lod0.bin, pano/*, and floors/floor_0_keyplan.png
     std::string ply_abs = (st_dir / "pointcloud.ply").string();
     std::string e57_abs = (st_dir / "station.e57").string();
     std::string lod0_abs = (st_dir / "cache" / "lod0.bin").string();
     std::string pano_abs = (st_dir / "pano" / "pano_rgb.jpg").string();
     std::string mask_abs = (st_dir / "pano" / "coverage_mask.png").string();
+    std::string keyplan_abs = (st_dir / "floors" / "floor_0_keyplan.png").string();
 
     if (!exportToPly(ply_abs, merged, true)) {
         out_error = "Failed to write pointcloud.ply";
@@ -773,6 +914,7 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
     }
     writeLod0Bin(lod0_abs, merged, 350000);
     generatePanoramaAndCoverageMask(merged, pano_abs, mask_abs, 1024, 512);
+    generateFloorKeyplanPng(merged, keyplan_abs, 1024, 1024);
 
     // 3. Compute coverage metrics
     double az_cov = 0.0, el_cov = 0.0;
@@ -844,6 +986,7 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
     json << "    \"point_cloud_ply\": \"pointcloud.ply\",\n";
     json << "    \"point_cloud_lod0\": \"cache/lod0.bin\",\n";
     json << "    \"station_e57\": \"station.e57\",\n";
+    json << "    \"floor_keyplan_png\": \"floors/floor_0_keyplan.png\",\n";
     json << "    \"total_merged_points\": " << merged.size() << "\n";
     json << "  },\n";
     json << "  \"registration_quality\": {\n";
@@ -929,6 +1072,59 @@ double TerrestrialStationManager::getImuMotionEnergy() const {
 bool TerrestrialStationManager::isStationary() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return stillness_duration_sec_ >= config_.settling_delay_sec;
+}
+
+bool TerrestrialStationManager::hasCapturedStopRgb() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stop_rgb_captured_;
+}
+
+std::string TerrestrialStationManager::nextAvailableStationIdWithPrefix(
+    const std::string& project_dir,
+    const std::string& prefix) {
+    const std::string safe_prefix = prefix.empty() ? "st_" : prefix;
+    int max_index = 0;
+
+    std::error_code ec;
+    const fs::path stations_root = fs::path(project_dir) / "stations";
+    if (fs::exists(stations_root, ec) && fs::is_directory(stations_root, ec)) {
+        for (const auto& entry : fs::directory_iterator(stations_root, ec)) {
+            if (ec) break;
+            if (!entry.is_directory(ec)) continue;
+            const std::string name = entry.path().filename().string();
+            if (name.rfind(safe_prefix, 0) == 0 && name.size() > safe_prefix.size()) {
+                const std::string suffix = name.substr(safe_prefix.size());
+                bool all_digits = !suffix.empty();
+                for (char ch : suffix) {
+                    if (ch < '0' || ch > '9') {
+                        all_digits = false;
+                        break;
+                    }
+                }
+                if (all_digits) {
+                    try {
+                        int parsed = std::stoi(suffix);
+                        if (parsed > max_index) {
+                            max_index = parsed;
+                        }
+                    } catch (...) {
+                        // Ignore non-integer or out-of-range directory names
+                    }
+                }
+            }
+        }
+    }
+
+    int next_idx = max_index + 1;
+    std::ostringstream oss;
+    oss << safe_prefix << std::setw(3) << std::setfill('0') << next_idx;
+    while (fs::exists(stations_root / oss.str(), ec)) {
+        ++next_idx;
+        oss.str("");
+        oss.clear();
+        oss << safe_prefix << std::setw(3) << std::setfill('0') << next_idx;
+    }
+    return oss.str();
 }
 
 std::string TerrestrialStationManager::getStationDirectory() const {

@@ -1,6 +1,6 @@
 # Artificial Vision — Unified Terrestrial & Hybrid Flash Station Baseline (`av-scan`)
 
-**Aligned with `av-ios` Commit `d5d4306` Cross-Repository Parity Specification**
+**Aligned with `av-ios` Commit `27cf5de` Cross-Repository Hardening Specification**
 
 ---
 
@@ -14,12 +14,13 @@ All three scanning products in the Artificial Vision ecosystem (**AV scanAR**, *
 | **Mode B — Standalone Terrestrial Station** | $60^\circ \times 6$ stops ($360^\circ$), $5.0\text{ s}$ stationary accumulation per stop | $60^\circ \times 6$ stops ($360^\circ$), $5.0\text{ s}$ stationary accumulation per stop | $60^\circ \times 6$ stops ($360^\circ$), $5.0\text{ s}$ stationary accumulation per stop |
 | **Mode C — Dynamic Hybrid "Flash Station"** | On-the-fly `Flash 60°` during active SLAM anchored at $T_{\text{world\_anchor}}$ | On-the-fly `Flash 60°` during active SLAM anchored at $T_{\text{world\_anchor}}$ | On-the-fly `Flash 60°` during active SLAM anchored at $T_{\text{world\_anchor}}$ |
 | **Primary 3D Sensor** | RoboSense Airy (96-beam + 200 Hz IMU) | RoboSense Airy (96-beam + 200 Hz IMU) | RoboSense RS-Airy (`robosense_airy_01`), Orbbec Gemini 336L (`orbbec_gemini_336l_01`), VITURE Luma Ultra (`viture_luma_ultra_01`), Composite `scanar_01` |
-| **LiDAR Mechanical Mount** | Calibrated pitch ($\sim 45^\circ$ forward tilt in `production_extrinsics.yaml` / `scanar_profile.json`) | Rigid clamp, $90^\circ$ pitch (forward-facing, cable down) | Profile-driven extrinsic matrix (`ScannerConfig` / `DeviceProfile` / `TerrestrialDeviceMountProfile`) |
-| **RGB Camera** | Orbbec Gemini 336L RGB/Stereo | Apple iPad / iPhone wide-angle camera | Orbbec Gemini 336L / Generic UVC Camera (with automatic LiDAR reflectivity panorama fallback when no RGB camera is active) |
+| **LiDAR Mechanical Mount & Extrinsics** | **Fixed enclosure**: calibrated rigid offsets (`production_extrinsics.yaml`, $\sim 45^\circ$ pitch) | **Variable / detachable mount**: session runtime-calibrated $T_{\text{cam\_lidar}}$ (`OnlineAutoCalibrator` / `TargetlessCalibrator`) | **Variable / detachable mount**: device profiles are nominal priors only; always consumes session runtime-calibrated $T_{\text{cam\_lidar}}$ (`ExtrinsicCalibrator` / `ScannerConfig`) |
+| **Multi-Station ID Allocation** | Directory-scanning `st_001, st_002, …` / `flash_st_001, …` | Directory-scanning `nextAvailableStationIdWithPrefix` | Directory-scanning `TerrestrialStationManager::nextAvailableStationIdWithPrefix` (`st_001, …` / `flash_st_001, …`) |
+| **Per-Stop RGB Capture** | Orbbec Gemini 336L full-res JPEG (`raw/images/stop_XXX.jpg`) | iPad / iPhone full-res JPEG (`raw/images/stop_XXX.jpg`) | Non-blocking Gemini 336L / UVC full-res JPEG (`raw/images/stop_XXX.jpg`), reset on `repeatCurrentStop()`, with LiDAR intensity panorama fallback if no camera is active |
 | **IMU Stillness Gate** | Dual-criterion gyro + accel gate (200 Hz Airy IMU) | Dual-criterion gyro + accel gate (200 Hz Airy IMU) | Dual-criterion gyro + accel gate with automatic $1.0\text{ s}$ LiDAR-timestamp settling fallback for LiDAR-only profiles |
 | **Motorized Tripod Support** | Non-blocking Manual / Detent or Auto Bluetooth/Serial Motor | Non-blocking Manual / Detent or Auto Bluetooth/Serial Motor | Non-blocking Manual / Detent (`ManualRotationController`) or Auto Motor (`AutoMotorRotationController`) |
 | **Station Coordinate Frame** | Right-handed metric: $+Z$ Up, $+X$ Forward at $0^\circ$, $+Y$ Left | Right-handed metric: $+Z$ Up, $+X$ Forward at $0^\circ$, $+Y$ Left | Right-handed metric: $+Z$ Up, $+X$ Forward at $0^\circ$, $+Y$ Left |
-| **Output Deliverables** | `station_manifest.json` (v1.0), `pointcloud.ply`, `station.e57`, `cache/lod0.bin`, `raw/stop_*.ply` | `station_manifest.json` (v1.0), `pointcloud.ply`, `station.e57`, `cache/lod0.bin`, `raw/stop_*.ply` | `station_manifest.json` (v1.0), `pointcloud.ply`, `station.e57`, `cache/lod0.bin`, `raw/stop_*.ply`, `pano/pano_rgb.jpg`, `pano/coverage_mask.png` |
+| **Output Deliverables** | `station_manifest.json` (v1.0), `pointcloud.ply`, `station.e57`, `cache/lod0.bin`, `floors/floor_0_keyplan.png`, `raw/stop_*.ply` | `station_manifest.json` (v1.0), `pointcloud.ply`, `station.e57`, `cache/lod0.bin`, `floors/floor_0_keyplan.png`, `raw/stop_*.ply` | `station_manifest.json` (v1.0), `pointcloud.ply`, `station.e57`, `cache/lod0.bin`, `floors/floor_0_keyplan.png` (true 24-bit RGB PNG), `pano/pano_rgb.jpg`, `pano/coverage_mask.png`, `raw/stop_*.ply`, `raw/images/stop_*.jpg` |
 
 ---
 

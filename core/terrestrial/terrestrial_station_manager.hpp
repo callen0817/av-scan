@@ -65,6 +65,11 @@ public:
     // 3D Azimuth & Elevation coverage analyzer across 36 azimuth x 18 elevation sectors (r >= 0.25m)
     void computeCoverageMetrics(double& out_az_cov, double& out_el_cov, std::string& out_warning) const;
 
+    // Directory-scanning station ID allocator (st_001, st_002, ... / flash_st_001, flash_st_002, ...)
+    static std::string nextAvailableStationIdWithPrefix(
+        const std::string& project_dir,
+        const std::string& prefix);
+
     // State queries
     TerrestrialCaptureState getCaptureState() const;
     uint32_t getCurrentStopIndex() const;
@@ -72,6 +77,7 @@ public:
     double getCurrentAccumulationProgress() const; // 0.0 to 1.0
     double getImuMotionEnergy() const;
     bool isStationary() const;
+    bool hasCapturedStopRgb() const;
     std::string getStationDirectory() const;
 
     const std::vector<StopObservation>& getCompletedStops() const;
@@ -106,6 +112,12 @@ public:
         int width = 1024,
         int height = 512);
 
+    static bool generateFloorKeyplanPng(
+        const std::vector<LidarPointXYZIRT>& merged_station_points,
+        const std::string& keyplan_png_path,
+        int width = 1024,
+        int height = 1024);
+
 private:
     bool finishCurrentStopLocked();
     bool writeStationArtifactsLocked(std::string& out_error);
@@ -139,6 +151,7 @@ private:
     std::vector<uint8_t> current_stop_rgb_pixels_;
     int current_stop_rgb_width_{0};
     int current_stop_rgb_height_{0};
+    bool stop_rgb_captured_{false};
 
     // Completed stops
     std::vector<StopObservation> stops_;

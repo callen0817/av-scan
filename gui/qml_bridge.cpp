@@ -5494,6 +5494,31 @@ bool QmlBridge::calibrateActiveScannerExtrinsics() {
                 storage_->saveScannerConfig(cfg);
             }
 
+            // Update session-level runtime calibrated T_cam_lidar for variable/detachable mounts
+            core::terrestrial::math::Quatd cal_q(
+                cal_res.transform.rotation.w,
+                cal_res.transform.rotation.x,
+                cal_res.transform.rotation.y,
+                cal_res.transform.rotation.z);
+            core::terrestrial::math::Vec3d cal_t(
+                cal_res.transform.translation.x,
+                cal_res.transform.translation.y,
+                cal_res.transform.translation.z);
+            core::terrestrial::math::SE3d T_ref_sec(core::terrestrial::math::SO3d(cal_q), cal_t);
+            const bool ref_is_lidar = (ref.role == "AIRY");
+            const bool sec_is_cam = (sec.role == "GEMINI" || sec.role == "CAMERA");
+            const bool ref_is_cam = (ref.role == "GEMINI" || ref.role == "CAMERA");
+            const bool sec_is_lidar = (sec.role == "AIRY");
+            if (ref_is_lidar && sec_is_cam) {
+                sessionCalibratedTCamLidar_ = T_ref_sec.inverse();
+                sessionExtrinsicIsCameraOptical_ = true;
+                hasSessionCalibratedExtrinsic_ = true;
+            } else if (ref_is_cam && sec_is_lidar) {
+                sessionCalibratedTCamLidar_ = T_ref_sec;
+                sessionExtrinsicIsCameraOptical_ = true;
+                hasSessionCalibratedExtrinsic_ = true;
+            }
+
             best_rmse_mm = cal_res.inlier_rmse_m * 1000.0;
             best_overlap_pct = cal_res.overlap_ratio * 100.0;
             best_conf = cal_res.confidence;
@@ -5996,14 +6021,29 @@ core::terrestrial::DeviceMountProfile QmlBridge::buildActiveTerrestrialMountProf
         prof.sensor_serial = activeSensors_.front().serial_number;
     }
 
-    // Load actual calibrated extrinsic transform from storage_ if available (never hardcode pitch when calibrated)
+    // Variable / detachable mount handling (matching av-ios):
+    // Treat device/mount profiles as nominal priors only. Always consume the session's
+    // active runtime-calibrated T_cam_lidar first, then persisted ScannerConfig calibration.
+    if (hasSessionCalibratedExtrinsic_) {
+        prof.T_cam_lidar = sessionCalibratedTCamLidar_;
+        prof.extrinsic_is_camera_optical = sessionExtrinsicIsCameraOptical_;
+        return prof;
+    }
+
     if (storage_ && !selectedScannerId_.isEmpty()) {
         core::schemas::ScannerConfig cfg;
         if (storage_->loadScannerConfig(selectedScannerId_.toStdString(), cfg)) {
             core::schemas::ExtrinsicTransform ext;
+            bool invert_ext = false;
             bool foundExt = cfg.get_relative_transform("GEMINI<-AIRY", ext) ||
-                            cfg.get_relative_transform("orbbec_gemini_336l_01<-robosense_airy_01", ext) ||
-                            cfg.get_relative_transform("AIRY", ext);
+                            cfg.get_relative_transform("CAMERA<-AIRY", ext) ||
+                            cfg.get_relative_transform("orbbec_gemini_336l_01<-robosense_airy_01", ext);
+            if (!foundExt) {
+                foundExt = cfg.get_relative_transform("AIRY<-GEMINI", ext) ||
+                           cfg.get_relative_transform("AIRY<-CAMERA", ext) ||
+                           cfg.get_relative_transform("robosense_airy_01<-orbbec_gemini_336l_01", ext);
+                invert_ext = foundExt;
+            }
             if (foundExt) {
                 core::terrestrial::math::Quatd q(
                     ext.rotation.w,
@@ -6014,7 +6054,8 @@ core::terrestrial::DeviceMountProfile QmlBridge::buildActiveTerrestrialMountProf
                     ext.translation.x,
                     ext.translation.y,
                     ext.translation.z);
-                prof.T_cam_lidar = core::terrestrial::math::SE3d(core::terrestrial::math::SO3d(q), t);
+                core::terrestrial::math::SE3d T_ext(core::terrestrial::math::SO3d(q), t);
+                prof.T_cam_lidar = invert_ext ? T_ext.inverse() : T_ext;
                 prof.extrinsic_is_camera_optical = true;
             }
         }
@@ -6084,24 +6125,52 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
         rebuildActiveSensorsForSelection();
     }
 
-    ++terrestrialStationCounter_;
-    std::ostringstream id_ss;
-    if (!stationId.trimmed().isEmpty()) {
-        id_ss << stationId.trimmed().toStdString();
-    } else if (isFlashDuringSlam) {
-        id_ss << "flash_st_" << std::setfill('0') << std::setw(3) << terrestrialStationCounter_;
-    } else {
-        id_ss << "st_" << std::setfill('0') << std::setw(3) << terrestrialStationCounter_;
-    }
-    terrestrialStationId_ = QString::fromStdString(id_ss.str());
-    terrestrialStationName_ = stationName.trimmed().isEmpty()
-        ? (isFlashDuringSlam
-            ? QString("Flash Station %1").arg(terrestrialStationCounter_)
-            : QString("Terrestrial Station %1").arg(terrestrialStationCounter_))
-        : stationName.trimmed();
-
     fs::path base_dir = storage_ ? fs::path(storage_->getRootDirectory()) : fs::current_path();
     fs::path proj_dir = base_dir / "projects" / projectId_.toStdString();
+
+    ++terrestrialStationCounter_;
+    std::string resolved_station_id;
+    if (!stationId.trimmed().isEmpty()) {
+        resolved_station_id = stationId.trimmed().toStdString();
+    } else {
+        resolved_station_id = core::terrestrial::TerrestrialStationManager::nextAvailableStationIdWithPrefix(
+            proj_dir.string(), isFlashDuringSlam ? "flash_st_" : "st_");
+    }
+    terrestrialStationId_ = QString::fromStdString(resolved_station_id);
+    terrestrialStationName_ = stationName.trimmed().isEmpty()
+        ? (isFlashDuringSlam
+            ? QString("Flash Station %1").arg(terrestrialStationId_)
+            : QString("Terrestrial Station %1").arg(terrestrialStationId_))
+        : stationName.trimmed();
+
+    // Register non-blocking full-resolution RGB callback on supported active cameras (Gemini / UVC)
+    auto cacheRgbCallback = [this](const core::schemas::ImageFrame& img) {
+        if (img.width <= 0 || img.height <= 0 || img.channels < 3 || img.data.empty()) {
+            return;
+        }
+        const size_t pixel_count = static_cast<size_t>(img.width) * static_cast<size_t>(img.height);
+        if (img.data.size() < pixel_count * static_cast<size_t>(img.channels)) {
+            return;
+        }
+        std::vector<uint8_t> rgb(pixel_count * 3);
+        const bool is_bgr = (img.encoding == "bgr8" || img.encoding == "BGR8");
+        for (size_t i = 0; i < pixel_count; ++i) {
+            const size_t src = i * static_cast<size_t>(img.channels);
+            rgb[i * 3 + 0] = is_bgr ? img.data[src + 2] : img.data[src + 0];
+            rgb[i * 3 + 1] = img.data[src + 1];
+            rgb[i * 3 + 2] = is_bgr ? img.data[src + 0] : img.data[src + 2];
+        }
+        std::lock_guard<std::mutex> lock(latestCameraRgbMutex_);
+        latestCameraRgbPixels_ = std::move(rgb);
+        latestCameraRgbWidth_ = img.width;
+        latestCameraRgbHeight_ = img.height;
+    };
+    if (geminiAdapter_) {
+        geminiAdapter_->registerImageCallback(cacheRgbCallback);
+    }
+    if (cameraAdapter_) {
+        cameraAdapter_->registerImageCallback(cacheRgbCallback);
+    }
 
     double nominalStep = (stepDeg > 0.0 && stepDeg <= 360.0) ? stepDeg : 60.0;
     size_t expectedStops = static_cast<size_t>(std::max(1, static_cast<int>(std::round(360.0 / nominalStep))));
@@ -6540,6 +6609,24 @@ void QmlBridge::tickTerrestrialStationCapture() {
                 lp.colorized = true;
                 frame.points.push_back(lp);
             }
+        }
+    }
+
+    // 2b. Capture one original-resolution RGB frame per stop once in ACCUMULATING_STOP (non-blocking)
+    if (terrestrialStationManager_->getCaptureState() == core::terrestrial::TerrestrialCaptureState::ACCUMULATING_STOP &&
+        !terrestrialStationManager_->hasCapturedStopRgb()) {
+        std::vector<uint8_t> rgbCopy;
+        int rgbW = 0, rgbH = 0;
+        {
+            std::lock_guard<std::mutex> lock(latestCameraRgbMutex_);
+            if (!latestCameraRgbPixels_.empty() && latestCameraRgbWidth_ > 0 && latestCameraRgbHeight_ > 0) {
+                rgbCopy = latestCameraRgbPixels_;
+                rgbW = latestCameraRgbWidth_;
+                rgbH = latestCameraRgbHeight_;
+            }
+        }
+        if (!rgbCopy.empty()) {
+            terrestrialStationManager_->pushCameraRgbBuffer(rgbCopy, rgbW, rgbH);
         }
     }
 

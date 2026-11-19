@@ -97,9 +97,12 @@ bool testForwardKinematicChainAndCoordinateFrames() {
         0.0, ios_profile.T_cam_lidar, calib, ios_profile.extrinsic_is_camera_optical);
     const math::SE3d T_90 = RotationGeometry::computeStationLidarTransform(
         90.0, ios_profile.T_cam_lidar, calib, ios_profile.extrinsic_is_camera_optical);
+    const math::SE3d T_180 = RotationGeometry::computeStationLidarTransform(
+        180.0, ios_profile.T_cam_lidar, calib, ios_profile.extrinsic_is_camera_optical);
 
-    const math::Vec3d p0  = T_0 * pt_lidar_forward;
-    const math::Vec3d p90 = T_90 * pt_lidar_forward;
+    const math::Vec3d p0   = T_0 * pt_lidar_forward;
+    const math::Vec3d p90  = T_90 * pt_lidar_forward;
+    const math::Vec3d p180 = T_180 * pt_lidar_forward;
 
     // At 0 deg: point should lie along +X_station (~10m) at constant height Z (+0.05m offset)
     EXPECT_NEAR(p0.x, 10.0, 1e-6, "At 0 deg, forward ray is along +X_station");
@@ -110,6 +113,22 @@ bool testForwardKinematicChainAndCoordinateFrames() {
     EXPECT_NEAR(p90.x, 0.0, 1e-6, "At 90 deg, forward ray X_station is 0");
     EXPECT_NEAR(p90.y, 10.0, 1e-6, "At 90 deg, forward ray is along +Y_station");
     EXPECT_NEAR(p90.z, 0.05, 1e-6, "At 90 deg, Z_station remains invariant at 0.05m");
+
+    // At 180 deg CCW around +Z_station: point should lie along -X_station (-10m) at the EXACT SAME Z height
+    EXPECT_NEAR(p180.x, -10.0, 1e-6, "At 180 deg, forward ray is along -X_station");
+    EXPECT_NEAR(p180.y, 0.0, 1e-6, "At 180 deg, Y_station is 0");
+    EXPECT_NEAR(p180.z, 0.05, 1e-6, "At 180 deg, Z_station remains invariant at 0.05m");
+
+    // Verify arbitrary runtime-calibrated variable mount extrinsic T_cam_lidar
+    // (detachable mount with non-zero roll/pitch/yaw + translation) preserves Z across 0/90/180 deg
+    const math::SE3d T_runtime_var(
+        math::SO3d(math::Quatd::FromEuler(0.12, -0.48, 0.25)),
+        math::Vec3d(0.03, -0.02, 0.07));
+    const math::Vec3d p_var_0   = RotationGeometry::computeStationLidarTransform(0.0, T_runtime_var, calib, true) * math::Vec3d(3.0, 1.0, 2.0);
+    const math::Vec3d p_var_90  = RotationGeometry::computeStationLidarTransform(90.0, T_runtime_var, calib, true) * math::Vec3d(3.0, 1.0, 2.0);
+    const math::Vec3d p_var_180 = RotationGeometry::computeStationLidarTransform(180.0, T_runtime_var, calib, true) * math::Vec3d(3.0, 1.0, 2.0);
+    EXPECT_NEAR(p_var_90.z, p_var_0.z, 1e-6, "Variable runtime mount preserves Z at 90 deg");
+    EXPECT_NEAR(p_var_180.z, p_var_0.z, 1e-6, "Variable runtime mount preserves Z at 180 deg");
 
     // Also test ScanAR 45-deg forward tilt profile and Airy upright profile:
     // rotating through 6 stops (0, 60, 120, 180, 240, 300) must preserve Z_station!
@@ -307,8 +326,9 @@ bool testFullSixStopStationRefinementAndExports() {
         }
     }
 
-    // Small known physical turntable placement offsets per stop (within +/- 1.0 deg)
-    const double true_angle_offsets_deg[6] = {0.0, 0.5, -0.4, 0.3, -0.5, 0.4};
+    // Synthetic physical turntable detent offsets per stop, including +1.5 deg error on Stop 1
+    // to verify constrained 1-DOF overlap refinement recovers 61.5 deg within <= 0.35 deg
+    const double true_angle_offsets_deg[6] = {0.0, 1.5, -0.4, 0.3, -0.5, 0.4};
     TripodAxisCalibration axis_calib;
 
     for (int stop = 0; stop < 6; ++stop) {
@@ -354,8 +374,10 @@ bool testFullSixStopStationRefinementAndExports() {
         mgr.pushLidarFrame(frame);
 
         // Push synthetic RGB frame for this stop
+        EXPECT_TRUE(!mgr.hasCapturedStopRgb(), "RGB flag initially false for stop");
         std::vector<uint8_t> rgb(64 * 32 * 3, static_cast<uint8_t>(40 + stop * 30));
         mgr.pushCameraRgbBuffer(rgb, 64, 32);
+        EXPECT_TRUE(mgr.hasCapturedStopRgb(), "RGB flag becomes true after pushCameraRgbBuffer");
 
         LidarFrame frame_end = frame;
         frame_end.timestamp_start_sec = base_t + 7.0;
@@ -389,9 +411,11 @@ bool testFullSixStopStationRefinementAndExports() {
     EXPECT_TRUE(mgr.getCaptureState() == TerrestrialCaptureState::STATION_COMPLETED,
                 "State is STATION_COMPLETED");
 
-    // Verify 1-DOF overlap refinement converged and recovered stop angles accurately
+    // Verify 1-DOF overlap refinement converged and recovered Stop 1's +1.5 deg detent error within <= 0.35 deg
     const auto& stops = mgr.getCompletedStops();
     EXPECT_TRUE(stops.size() == 6, "All 6 stops recorded");
+    EXPECT_NEAR(stops[1].measured_angle_deg, 61.5, 0.35,
+                "Stop 1 recovers synthetic +1.5 deg detent error (61.5 deg) within <= 0.35 deg");
     for (size_t i = 1; i < stops.size(); ++i) {
         EXPECT_TRUE(stops[i].registration_converged, "Stop 1-DOF overlap refinement converged");
         EXPECT_TRUE(stops[i].registration_residual_rmse_m < 0.15,
@@ -412,6 +436,7 @@ bool testFullSixStopStationRefinementAndExports() {
     const fs::path lod0_path     = st_dir / "cache" / "lod0.bin";
     const fs::path pano_path     = st_dir / "pano" / "pano_rgb.jpg";
     const fs::path mask_path     = st_dir / "pano" / "coverage_mask.png";
+    const fs::path keyplan_path  = st_dir / "floors" / "floor_0_keyplan.png";
 
     EXPECT_TRUE(fs::exists(manifest_path), "station_manifest.json exists");
     EXPECT_TRUE(fs::exists(ply_path), "pointcloud.ply exists");
@@ -419,6 +444,35 @@ bool testFullSixStopStationRefinementAndExports() {
     EXPECT_TRUE(fs::exists(lod0_path), "cache/lod0.bin exists");
     EXPECT_TRUE(fs::exists(pano_path), "pano/pano_rgb.jpg exists");
     EXPECT_TRUE(fs::exists(mask_path), "pano/coverage_mask.png exists");
+    EXPECT_TRUE(fs::exists(keyplan_path), "floors/floor_0_keyplan.png exists");
+
+    // Verify genuine PNG signature (\x89PNG\r\n\x1a\n) + IHDR + IEND chunks on keyplan and coverage mask
+    auto verifyGenuinePng = [](const fs::path& p, uint8_t expected_color_type) -> bool {
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs.is_open()) return false;
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(ifs)),
+                                   std::istreambuf_iterator<char>());
+        if (bytes.size() < 45) return false;
+        const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        for (int i = 0; i < 8; ++i) {
+            if (bytes[i] != sig[i]) return false;
+        }
+        // First chunk must be IHDR (length = 13, type = "IHDR")
+        if (bytes[8] != 0 || bytes[9] != 0 || bytes[10] != 0 || bytes[11] != 13) return false;
+        if (bytes[12] != 'I' || bytes[13] != 'H' || bytes[14] != 'D' || bytes[15] != 'R') return false;
+        // Color type is byte 25 (16 + 4 width + 4 height + 1 bit_depth)
+        if (bytes[25] != expected_color_type) return false;
+        // Last 12 bytes must be IEND chunk (0 length + "IEND" + 4-byte CRC)
+        const size_t n = bytes.size();
+        if (bytes[n - 8] != 'I' || bytes[n - 7] != 'E' || bytes[n - 6] != 'N' || bytes[n - 5] != 'D') {
+            return false;
+        }
+        return true;
+    };
+    EXPECT_TRUE(verifyGenuinePng(keyplan_path, 2 /* RGB24 */),
+                "floors/floor_0_keyplan.png has valid PNG signature, 24-bit RGB IHDR, and IEND");
+    EXPECT_TRUE(verifyGenuinePng(mask_path, 0 /* Gray8 */),
+                "pano/coverage_mask.png has valid PNG signature, Gray8 IHDR, and IEND");
 
     // Verify station_manifest.json v1.0 schema keys
     {
@@ -445,6 +499,8 @@ bool testFullSixStopStationRefinementAndExports() {
                     "Manifest has refined_angle_deg per stop");
         EXPECT_TRUE(json_str.find("\"point_cloud_lod0\": \"cache/lod0.bin\"") != std::string::npos,
                     "Manifest has point_cloud_lod0: cache/lod0.bin");
+        EXPECT_TRUE(json_str.find("\"floor_keyplan_png\": \"floors/floor_0_keyplan.png\"") != std::string::npos,
+                    "Manifest has floor_keyplan_png: floors/floor_0_keyplan.png");
     }
 
     // Round-trip test for pointcloud.ply
@@ -479,7 +535,51 @@ bool testFullSixStopStationRefinementAndExports() {
     return true;
 }
 
-// 5. Test Non-Blocking Rotation Controllers & 360-deg Cable Safety Guard
+// 5. Test Auto-Incrementing Directory-Scanning Station IDs & Repeat-Stop RGB Flag Reset
+bool testAutoIncrementStationIdsAndRepeatRgbReset() {
+    std::cout << "[RUN ] testAutoIncrementStationIdsAndRepeatRgbReset\n";
+
+    const fs::path temp_root = fs::temp_directory_path() / "av_scan_test_station_ids";
+    fs::remove_all(temp_root);
+
+    // First standalone & flash IDs on empty project
+    EXPECT_TRUE(TerrestrialStationManager::nextAvailableStationIdWithPrefix(temp_root.string(), "st_") == "st_001",
+                "First standalone station ID is st_001");
+    EXPECT_TRUE(TerrestrialStationManager::nextAvailableStationIdWithPrefix(temp_root.string(), "flash_st_") == "flash_st_001",
+                "First flash station ID is flash_st_001");
+
+    // Create st_001, st_002 and flash_st_001 on disk -> next allocations must never overwrite
+    fs::create_directories(temp_root / "stations" / "st_001");
+    fs::create_directories(temp_root / "stations" / "st_002");
+    fs::create_directories(temp_root / "stations" / "flash_st_001");
+
+    EXPECT_TRUE(TerrestrialStationManager::nextAvailableStationIdWithPrefix(temp_root.string(), "st_") == "st_003",
+                "Next standalone station ID skips existing st_001/st_002 -> st_003");
+    EXPECT_TRUE(TerrestrialStationManager::nextAvailableStationIdWithPrefix(temp_root.string(), "flash_st_") == "flash_st_002",
+                "Next flash station ID skips existing flash_st_001 -> flash_st_002");
+
+    // Verify repeatCurrentStop resets the per-stop RGB capture flag so a fresh image is captured
+    TerrestrialStationConfig cfg;
+    cfg.project_id = "proj_repeat";
+    cfg.station_id = TerrestrialStationManager::nextAvailableStationIdWithPrefix(temp_root.string(), "st_");
+    TerrestrialStationManager mgr;
+    EXPECT_TRUE(mgr.startNewStation(temp_root.string(), cfg, DeviceMountProfile::makeAiryProfile()),
+                "startNewStation succeeded");
+    mgr.beginCurrentStopAccumulation();
+    EXPECT_TRUE(!mgr.hasCapturedStopRgb(), "hasCapturedStopRgb starts false");
+    std::vector<uint8_t> rgb(16 * 16 * 3, 128);
+    mgr.pushCameraRgbBuffer(rgb, 16, 16);
+    EXPECT_TRUE(mgr.hasCapturedStopRgb(), "hasCapturedStopRgb is true after capture");
+    EXPECT_TRUE(mgr.repeatCurrentStop(), "repeatCurrentStop succeeded");
+    EXPECT_TRUE(!mgr.hasCapturedStopRgb(), "repeatCurrentStop resets hasCapturedStopRgb to false");
+
+    fs::remove_all(temp_root);
+    std::cout << "[PASS] testAutoIncrementStationIdsAndRepeatRgbReset\n";
+    ++g_tests_passed;
+    return true;
+}
+
+// 6. Test Non-Blocking Rotation Controllers & 360-deg Cable Safety Guard
 bool testRotationControllersAndCableSafety() {
     std::cout << "[RUN ] testRotationControllersAndCableSafety\n";
 
@@ -534,6 +634,7 @@ int main() {
     testForwardKinematicChainAndCoordinateFrames();
     testStillnessGateBumpResetAndLidarFallback();
     testFullSixStopStationRefinementAndExports();
+    testAutoIncrementStationIdsAndRepeatRgbReset();
     testRotationControllersAndCableSafety();
 
     std::cout << "-----------------------------------------------------------------\n";

@@ -979,6 +979,17 @@ private:
     QString lastTerrestrialStationPath_{""};
     int terrestrialStationCounter_{0};
     double terrestrialSyntheticClockSec_{0.0};
+
+    // Variable / detachable mount session-level runtime calibrated T_cam_lidar
+    bool hasSessionCalibratedExtrinsic_{false};
+    core::terrestrial::math::SE3d sessionCalibratedTCamLidar_{core::terrestrial::math::SE3d::Identity()};
+    bool sessionExtrinsicIsCameraOptical_{true};
+
+    // Non-blocking per-stop original-resolution RGB frame cache (Gemini / UVC)
+    mutable std::mutex latestCameraRgbMutex_;
+    std::vector<uint8_t> latestCameraRgbPixels_;
+    int latestCameraRgbWidth_{0};
+    int latestCameraRgbHeight_{0};
 };
 
 } // namespace av::gui
