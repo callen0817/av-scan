@@ -29,7 +29,7 @@ enum class MotorVerificationStatus : uint8_t {
 enum class AcquisitionMode : uint8_t {
     MOBILE_SLAM = 0,          // Mode A: Continuous Mobile SLAM
     TERRESTRIAL_STATION = 1,  // Mode B: Standalone Terrestrial Station (60 deg x 6 stops at 5.0s)
-    HYBRID_FLASH_STATION = 2  // Mode C: Dynamic Hybrid "Flash Station" during active SLAM
+    HYBRID_FLASH_STATION = 2  // Mode C: Single-shot stationary Flash Scan during active SLAM (no motor/rotation)
 };
 
 struct LidarPointXYZIRT {
@@ -158,7 +158,12 @@ struct TerrestrialStationConfig {
     std::string project_id{"PROJECT_001"};
     std::string station_id{"st_001"};
     std::string station_name{"Station 01"};
-    std::string mode{"terrestrial"};          // "terrestrial" or "flash_station"
+    std::string mode{"terrestrial"};          // "terrestrial" or "flash_scan"
+
+    // Single-shot Flash Scan during Mobile SLAM:
+    // Accumulates stationary frames from the current pose ONLY (1 stop, no motor/turntable rotation).
+    bool is_single_shot_flash{false};
+    math::SE3d T_body_lidar{math::SE3d::Identity()};
 
     RotationMode rotation_mode{RotationMode::MANUAL_INDEX};
     double nominal_step_deg{60.0};            // Default 6-stop 360 degree scan (60 deg at 5.0 sec)

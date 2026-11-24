@@ -522,7 +522,7 @@ public:
     QString acquisitionMode() const { return acquisitionMode_; }
     bool isTerrestrialMode() const { return acquisitionMode_ == "TERRESTRIAL"; }
     bool isTerrestrialStationActive() const { return isTerrestrialStationActive_; }
-    bool isFlashStationActive() const { return isTerrestrialStationActive_ && isSlamPausedForStation_; }
+    bool isFlashStationActive() const { return isTerrestrialStationActive_ && (isSlamPausedForStation_ || isSingleShotFlashActive_); }
     bool isSlamPausedForStation() const { return isSlamPausedForStation_; }
     QString motorVerificationStatus() const;
     QString motorDeviceModel() const { return motorDeviceModel_; }
@@ -592,6 +592,7 @@ public:
                                              const QString& stationName = "",
                                              double stepDeg = 60.0,
                                              bool isFlashDuringSlam = false);
+    Q_INVOKABLE bool triggerFlashScan(const QString& label = "");
     Q_INVOKABLE bool triggerFlashStation60(const QString& label = "");
     Q_INVOKABLE bool beginTerrestrialStop();
     Q_INVOKABLE bool finishTerrestrialStop();
@@ -971,6 +972,7 @@ private:
     QString acquisitionMode_{"MOBILE_SLAM"};
     bool isTerrestrialStationActive_{false};
     bool isSlamPausedForStation_{false};
+    bool isSingleShotFlashActive_{false};
     core::terrestrial::math::SE3d flashStationAnchorPose_{core::terrestrial::math::SE3d::Identity()};
     std::vector<core::schemas::PointXYZI> preFlashSlamCloud_;
     std::vector<core::schemas::Pose3D> preFlashSlamTrajectory_;

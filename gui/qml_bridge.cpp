@@ -5960,8 +5960,24 @@ QString QmlBridge::terrestrialStatusNote() const {
         return "Ready for 6-stop 360° terrestrial capture (60° increments, 5.0s per stop).";
     }
     const auto meta = terrestrialStationManager_->getStationMetadata();
-    if (!meta.coverage_warning.empty()) return QString::fromStdString(meta.coverage_warning);
+    const bool isFlash = isFlashStationActive() || (meta.mode == "flash_scan");
     auto st = terrestrialStationManager_->getCaptureState();
+    if (isFlash) {
+        if (st == core::terrestrial::TerrestrialCaptureState::WAITING_FOR_STILLNESS) {
+            return "Flash Scan: Hold still (0.5s settling · no tripod/motor required)...";
+        }
+        if (st == core::terrestrial::TerrestrialCaptureState::ACCUMULATING_STOP) {
+            return QString("Flash Scan: Hold still — accumulating stationary cloud (%1%)...")
+                .arg(static_cast<int>(std::round(terrestrialStationManager_->getCurrentAccumulationProgress() * 100.0)));
+        }
+        if (st == core::terrestrial::TerrestrialCaptureState::STOP_COMPLETED ||
+            st == core::terrestrial::TerrestrialCaptureState::STATION_COMPLETED) {
+            return QString("Flash Scan %1 captured — anchoring dense cloud & resuming SLAM...")
+                .arg(terrestrialStationId_);
+        }
+        return "Flash Scan ready (1-tap stationary capture, no motor needed).";
+    }
+    if (!meta.coverage_warning.empty()) return QString::fromStdString(meta.coverage_warning);
     if (st == core::terrestrial::TerrestrialCaptureState::WAITING_FOR_STILLNESS) {
         return QString("Stop %1/%2 (%3°): Waiting 1.0s for stillness...")
             .arg(terrestrialStationManager_->getCurrentStopIndex() + 1)
@@ -6116,9 +6132,12 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
         return false;
     }
 
-    // Non-blocking motor verification guard: default to manual detent head if operator hasn't confirmed yet
-    if (motorStatus_ == core::terrestrial::MotorVerificationStatus::UNVERIFIED || !rotationController_) {
-        confirmMotorAttached(false, "Manual Tripod Head / 60° Detent Turntable");
+    // Flash Scan is completely decoupled from motorized/turntable Terrestrial Mode:
+    // ONLY standalone Mode B Terrestrial requires/initializes a rotation controller.
+    if (!isFlashDuringSlam) {
+        if (motorStatus_ == core::terrestrial::MotorVerificationStatus::UNVERIFIED || !rotationController_) {
+            confirmMotorAttached(false, "Manual Tripod Head / 60° Detent Turntable");
+        }
     }
 
     if (activeSensors_.empty()) {
@@ -6139,7 +6158,7 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
     terrestrialStationId_ = QString::fromStdString(resolved_station_id);
     terrestrialStationName_ = stationName.trimmed().isEmpty()
         ? (isFlashDuringSlam
-            ? QString("Flash Station %1").arg(terrestrialStationId_)
+            ? QString("Flash Scan %1").arg(terrestrialStationId_)
             : QString("Terrestrial Station %1").arg(terrestrialStationId_))
         : stationName.trimmed();
 
@@ -6172,27 +6191,37 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
         cameraAdapter_->registerImageCallback(cacheRgbCallback);
     }
 
-    double nominalStep = (stepDeg > 0.0 && stepDeg <= 360.0) ? stepDeg : 60.0;
-    size_t expectedStops = static_cast<size_t>(std::max(1, static_cast<int>(std::round(360.0 / nominalStep))));
+    const double nominalStep = isFlashDuringSlam
+        ? 0.0
+        : ((stepDeg > 0.0 && stepDeg <= 360.0) ? stepDeg : 60.0);
+    const size_t expectedStops = isFlashDuringSlam
+        ? 1
+        : static_cast<size_t>(std::max(1, static_cast<int>(std::round(360.0 / nominalStep))));
 
     core::terrestrial::TerrestrialStationConfig cfg;
     cfg.project_id = projectId_.toStdString();
     cfg.station_id = terrestrialStationId_.toStdString();
     cfg.station_name = terrestrialStationName_.toStdString();
-    cfg.mode = isFlashDuringSlam ? "flash_station" : "terrestrial";
-    cfg.rotation_mode = (motorStatus_ == core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED)
-        ? core::terrestrial::RotationMode::AUTOMATIC_MOTOR
-        : core::terrestrial::RotationMode::MANUAL_INDEX;
+    cfg.is_single_shot_flash = isFlashDuringSlam;
+    cfg.T_body_lidar = core::terrestrial::math::SE3d::Identity();
+    cfg.mode = isFlashDuringSlam ? "flash_scan" : "terrestrial";
+    cfg.rotation_mode = isFlashDuringSlam
+        ? core::terrestrial::RotationMode::MANUAL_INDEX
+        : ((motorStatus_ == core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED)
+            ? core::terrestrial::RotationMode::AUTOMATIC_MOTOR
+            : core::terrestrial::RotationMode::MANUAL_INDEX);
     cfg.nominal_step_deg = nominalStep;
     cfg.total_expected_stops = expectedStops;
     cfg.accumulation_sec_per_stop = 5.0;
-    cfg.settling_delay_sec = 1.0;
+    cfg.settling_delay_sec = isFlashDuringSlam ? 0.5 : 1.0;
     cfg.max_motion_angular_vel_rads = 0.05;
-    cfg.enable_overlap_refinement = true;
+    cfg.enable_overlap_refinement = !isFlashDuringSlam;
     cfg.enable_camera_capture = true;
 
+    isSingleShotFlashActive_ = isFlashDuringSlam;
+
     if (isFlashDuringSlam && isCapturing_) {
-        // Mode C: Dynamic Hybrid Flash Station during active Mobile SLAM
+        // Mode C: Single-shot stationary Flash Scan during active Mobile SLAM (no motor/rotation)
         // 1. Lock World Anchor Pose T_world_anchor = T_world_body(t_pause)
         double yaw_rad = static_cast<double>(currentYaw_) * M_PI / 180.0;
         core::terrestrial::math::SO3d anchor_rot(core::terrestrial::math::Quatd::FromEuler(0.0, 0.0, yaw_rad));
@@ -6212,12 +6241,12 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
         isSlamPausedForStation_ = true;
         isTerrestrialStationActive_ = true;
         acquisitionMode_ = "HYBRID_FLASH_STATION";
-        trackingStatus_ = "FLASH STATION (SLAM PAUSED)";
+        trackingStatus_ = "FLASH SCAN (HOLD STILL 5s)";
     } else {
-        // Mode B: Standalone Terrestrial Station
+        // Standalone Terrestrial Station (Mode B) or standalone single-shot Flash Scan when idle
         isSlamPausedForStation_ = false;
         isTerrestrialStationActive_ = true;
-        acquisitionMode_ = "TERRESTRIAL";
+        acquisitionMode_ = isFlashDuringSlam ? "HYBRID_FLASH_STATION" : "TERRESTRIAL";
         flashStationAnchorPose_ = core::terrestrial::math::SE3d::Identity();
         preFlashSlamCloud_.clear();
         preFlashSlamTrajectory_.clear();
@@ -6245,19 +6274,25 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
         isCapturing_ = true;
         canSave_ = false;
         captureState_ = "CAPTURING";
-        sensorStatus_ = QString("TERRESTRIAL STATION: %1").arg(terrestrialStationName_);
-        trackingStatus_ = "STATIONARY TURNTABLE (6 STOPS x 60°)";
+        sensorStatus_ = isFlashDuringSlam
+            ? QString("FLASH SCAN: %1").arg(terrestrialStationName_)
+            : QString("TERRESTRIAL STATION: %1").arg(terrestrialStationName_);
+        trackingStatus_ = isFlashDuringSlam
+            ? "FLASH SCAN (HOLD STILL 5s)"
+            : "STATIONARY TURNTABLE (6 STOPS x 60°)";
         if (!timer_->isActive()) timer_->start(1000);
         if (!telemetryTimer_->isActive()) telemetryTimer_->start(100);
     }
 
     terrestrialSyntheticClockSec_ = 0.0;
     auto mountProfile = buildActiveTerrestrialMountProfile();
-    terrestrialStationManager_ = std::make_unique<core::terrestrial::TerrestrialStationManager>(cfg, rotationController_);
+    terrestrialStationManager_ = std::make_unique<core::terrestrial::TerrestrialStationManager>(
+        cfg, isFlashDuringSlam ? nullptr : rotationController_);
 
     if (!terrestrialStationManager_->startNewStation(proj_dir.string(), cfg, mountProfile)) {
         isTerrestrialStationActive_ = false;
         isSlamPausedForStation_ = false;
+        isSingleShotFlashActive_ = false;
         emit terrestrialStateChanged();
         emit errorOccurred("Terrestrial Station Error", "Failed to initialize terrestrial station directory.");
         return false;
@@ -6270,16 +6305,28 @@ bool QmlBridge::startTerrestrialStation(const QString& stationId,
     emit captureStateChanged();
     emit sensorStatusChanged();
     emit trackingStatusChanged();
-    emit notification(isFlashDuringSlam ? "Hybrid Flash Station Started" : "Terrestrial Station Started",
-                      QString("%1 initialized (%2 stops at %3° increments, 5.0s accumulation/stop).")
-                          .arg(terrestrialStationName_)
-                          .arg(expectedStops)
-                          .arg(nominalStep, 0, 'f', 0));
+    if (isFlashDuringSlam) {
+        emit notification("Flash Scan Started",
+                          QString("%1: hold still for 5.0s stationary accumulation (no tripod or motor needed).")
+                              .arg(terrestrialStationName_));
+    } else {
+        emit notification("Terrestrial Station Started",
+                          QString("%1 initialized (%2 stops at %3° increments, 5.0s accumulation/stop).")
+                              .arg(terrestrialStationName_)
+                              .arg(expectedStops)
+                              .arg(nominalStep, 0, 'f', 0));
+    }
     return true;
 }
 
+bool QmlBridge::triggerFlashScan(const QString& label) {
+    // Always launch single-shot motor-free Flash Scan (never 6x60 deg Terrestrial Mode)
+    return startTerrestrialStation("", label, 0.0, true);
+}
+
 bool QmlBridge::triggerFlashStation60(const QString& label) {
-    return startTerrestrialStation("", label, 60.0, isCapturing_);
+    // Backwards-compatible alias forwarding to motor-free single-shot Flash Scan
+    return triggerFlashScan(label);
 }
 
 bool QmlBridge::beginTerrestrialStop() {
@@ -6324,6 +6371,7 @@ void QmlBridge::cancelTerrestrialStation() {
         terrestrialStationManager_->cancelStation();
     }
     isTerrestrialStationActive_ = false;
+    isSingleShotFlashActive_ = false;
 
     if (wasFlash) {
         mapPoints_ = preFlashSlamCloud_;
@@ -6465,15 +6513,17 @@ bool QmlBridge::finalizeAndSaveTerrestrialStation() {
                               .arg(flashStationAnchorPose_.translation.y, 0, 'f', 2)
                               .arg(flashStationAnchorPose_.translation.z, 0, 'f', 2));
     } else {
-        // Standalone Terrestrial Station completed
+        // Standalone Terrestrial Station or standalone single-shot Flash Scan completed
+        const bool wasStandaloneFlash = isSingleShotFlashActive_;
         timer_->stop();
         telemetryTimer_->stop();
         isTerrestrialStationActive_ = false;
+        isSingleShotFlashActive_ = false;
         isCapturing_ = false;
         canSave_ = true;
         captureState_ = "STOPPED";
         sensorStatus_ = "READY";
-        trackingStatus_ = "STATION COMPLETED";
+        trackingStatus_ = wasStandaloneFlash ? "FLASH SCAN COMPLETED" : "STATION COMPLETED";
 
         mapPoints_ = std::move(convertedStationPts);
         pointsCaptured_ = static_cast<qlonglong>(mapPoints_.size());
@@ -6484,11 +6534,16 @@ bool QmlBridge::finalizeAndSaveTerrestrialStation() {
             s.point_count = mapPoints_.size();
         }
 
-        exportStatus_ = QString("Saved Terrestrial Station %1 (%2 points, RMSE %3 mm) -> %4")
-            .arg(terrestrialStationId_)
-            .arg(pointsCaptured_)
-            .arg(terrestrialOverallRmseMm(), 0, 'f', 2)
-            .arg(lastTerrestrialStationPath_);
+        exportStatus_ = wasStandaloneFlash
+            ? QString("Saved Flash Scan %1 (%2 points) -> %3")
+                  .arg(terrestrialStationId_)
+                  .arg(pointsCaptured_)
+                  .arg(lastTerrestrialStationPath_)
+            : QString("Saved Terrestrial Station %1 (%2 points, RMSE %3 mm) -> %4")
+                  .arg(terrestrialStationId_)
+                  .arg(pointsCaptured_)
+                  .arg(terrestrialOverallRmseMm(), 0, 'f', 2)
+                  .arg(lastTerrestrialStationPath_);
 
         invalidateDisplayPointsCache();
         emit terrestrialStateChanged();
@@ -6502,7 +6557,7 @@ bool QmlBridge::finalizeAndSaveTerrestrialStation() {
         emit mapDataUpdated();
         emit canStartChanged();
 
-        emit notification("Terrestrial Station Completed", exportStatus_);
+        emit notification(wasStandaloneFlash ? "Flash Scan Completed" : "Terrestrial Station Completed", exportStatus_);
     }
 
     return true;
@@ -6518,6 +6573,7 @@ bool QmlBridge::resumeSlamAfterFlashStation() {
 
     isSlamPausedForStation_ = false;
     isTerrestrialStationActive_ = false;
+    isSingleShotFlashActive_ = false;
     acquisitionMode_ = "MOBILE_SLAM";
     trackingStatus_ = "TRACKING (ANCHORED)";
 
@@ -6668,8 +6724,17 @@ void QmlBridge::tickTerrestrialStationCapture() {
         emit mapDataUpdated();
     }
 
-    // 4. If automatic motorized controller is connected and stop just completed, auto-advance or finalize
-    if (terrestrialStationManager_->getCaptureState() == core::terrestrial::TerrestrialCaptureState::STOP_COMPLETED &&
+    // 4. Auto-finalize single-shot Flash Scan immediately on completion (ZERO motor required!),
+    //    or auto-advance/finalize multi-stop Terrestrial Mode when an automatic motor is connected.
+    const auto postState = terrestrialStationManager_->getCaptureState();
+    if (isSingleShotFlashActive_ &&
+        (postState == core::terrestrial::TerrestrialCaptureState::STATION_COMPLETED ||
+         postState == core::terrestrial::TerrestrialCaptureState::STOP_COMPLETED)) {
+        finalizeAndSaveTerrestrialStation();
+        return;
+    }
+
+    if (postState == core::terrestrial::TerrestrialCaptureState::STOP_COMPLETED &&
         motorStatus_ == core::terrestrial::MotorVerificationStatus::AUTOMATIC_CONNECTED) {
         if (terrestrialStationManager_->getCurrentStopIndex() + 1 <
             terrestrialStationManager_->getStationMetadata().expected_stops) {

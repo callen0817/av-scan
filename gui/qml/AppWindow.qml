@@ -1967,7 +1967,6 @@ ApplicationWindow {
                             onClicked: {
                                 bridge.setAcquisitionMode("TERRESTRIAL");
                                 if (bridge.motorVerificationStatus === "UNVERIFIED") {
-                                    motorConfirmDialog.pendingFlashMode = false;
                                     motorConfirmDialog.pendingStartImmediately = false;
                                     motorConfirmDialog.open();
                                 }
@@ -1992,7 +1991,7 @@ ApplicationWindow {
                 Button {
                     id: startBtn
                     text: bridge.isTerrestrialStationActive
-                        ? "● STATION ACTIVE"
+                        ? (bridge.isFlashStationActive ? "⚡ FLASHING..." : "● STATION ACTIVE")
                         : (bridge.isCapturing
                             ? "● SCANNING..."
                             : (bridge.isTerrestrialMode ? "▶ START STATION" : "▶ START SCAN"))
@@ -2003,7 +2002,6 @@ ApplicationWindow {
                         root.ensureActiveProjectOpen();
                         if (bridge.isTerrestrialMode) {
                             if (bridge.motorVerificationStatus === "UNVERIFIED") {
-                                motorConfirmDialog.pendingFlashMode = false;
                                 motorConfirmDialog.pendingStartImmediately = true;
                                 motorConfirmDialog.open();
                             } else {
@@ -2054,22 +2052,16 @@ ApplicationWindow {
                     }
                 }
 
-                // 2b. Dynamic Hybrid "Flash 60°" Station Trigger during Active SLAM
+                // 2b. Single-Shot Stationary Flash Scan (1-tap, zero motor/turntable required)
                 Button {
                     id: flashStation60Btn
-                    text: bridge.isFlashStationActive ? "⚡ FLASH ACTIVE" : "⚡ Flash 60°"
+                    text: bridge.isFlashStationActive ? "⚡ FLASHING..." : "⚡ Flash Scan"
                     enabled: !bridge.isTerrestrialStationActive
                     implicitHeight: 34
-                    implicitWidth: 96
+                    implicitWidth: 102
                     onClicked: {
                         root.ensureActiveProjectOpen();
-                        if (bridge.motorVerificationStatus === "UNVERIFIED") {
-                            motorConfirmDialog.pendingFlashMode = true;
-                            motorConfirmDialog.pendingStartImmediately = true;
-                            motorConfirmDialog.open();
-                        } else {
-                            bridge.triggerFlashStation60("");
-                        }
+                        bridge.triggerFlashScan("");
                     }
                     contentItem: Text {
                         text: flashStation60Btn.text
@@ -2488,7 +2480,9 @@ ApplicationWindow {
                             anchors.rightMargin: 10
                             anchors.verticalCenter: parent.verticalCenter
                             text: bridge.isTerrestrialStationActive
-                                ? ("TERRESTRIAL STATION  ·  " + bridge.terrestrialStatusNote)
+                                ? (bridge.isFlashStationActive
+                                    ? ("FLASH SCAN  ·  " + bridge.terrestrialStatusNote)
+                                    : ("TERRESTRIAL STATION  ·  " + bridge.terrestrialStatusNote))
                                 : (bridge.isCapturing
                                     ? ("STAGE 2  ·  ACTIVE SPATIAL CAPTURE — Walking AR Passthrough Active  ·  Anchor: " + (bridge.activeAnchorSensor || "AIRY"))
                                     : (bridge.isTerrestrialMode
@@ -2519,7 +2513,7 @@ ApplicationWindow {
                     }
                 }
 
-                // Real-Time Terrestrial Station & Hybrid Flash Station HUD Banner
+                // Real-Time Terrestrial Station & Single-Shot Flash Scan HUD Banner
                 Rectangle {
                     id: terrestrialHudStrip
                     visible: bridge.isTerrestrialMode || bridge.isTerrestrialStationActive
@@ -2536,18 +2530,20 @@ ApplicationWindow {
                         anchors.rightMargin: 10
                         spacing: 8
 
-                        // Stop X/6 + Angle badge
+                        // Stop X/6 + Angle badge (Terrestrial) OR Single-Shot Flash badge (Flash Scan)
                         Rectangle {
                             implicitHeight: 26
-                            implicitWidth: 126
+                            implicitWidth: bridge.isFlashStationActive ? 148 : 126
                             radius: 6
                             color: "#2EBAA164"
                             border.color: root.avGoldPrimary
                             border.width: 1
                             Text {
                                 anchors.centerIn: parent
-                                text: "STOP " + (bridge.terrestrialStopIndex + 1) + "/" + bridge.terrestrialTotalExpectedStops +
-                                      " (" + Math.round(bridge.terrestrialCurrentAngleDeg) + "°)"
+                                text: bridge.isFlashStationActive
+                                    ? "⚡ FLASH (HOLD STILL)"
+                                    : ("STOP " + (bridge.terrestrialStopIndex + 1) + "/" + bridge.terrestrialTotalExpectedStops +
+                                       " (" + Math.round(bridge.terrestrialCurrentAngleDeg) + "°)")
                                 color: root.avGoldBright
                                 font.pixelSize: 11
                                 font.bold: true
@@ -2610,13 +2606,13 @@ ApplicationWindow {
 
                         Item { Layout.fillWidth: true }
 
-                        // Interactive Turntable & Station Controls
+                        // Interactive Turntable & Station Controls (Head & +60° strictly for Terrestrial Mode)
                         Button {
                             text: "⚙ Head"
+                            visible: !bridge.isFlashStationActive
                             implicitHeight: 26
                             implicitWidth: 58
                             onClicked: {
-                                motorConfirmDialog.pendingFlashMode = bridge.isFlashStationActive;
                                 motorConfirmDialog.pendingStartImmediately = false;
                                 motorConfirmDialog.open();
                             }
@@ -2660,7 +2656,7 @@ ApplicationWindow {
 
                         Button {
                             text: "Next (+60°) →"
-                            visible: bridge.isTerrestrialStationActive
+                            visible: bridge.isTerrestrialStationActive && !bridge.isFlashStationActive
                             enabled: bridge.terrestrialStopIndex + 1 < bridge.terrestrialTotalExpectedStops
                             implicitHeight: 26
                             implicitWidth: 92
@@ -2682,10 +2678,10 @@ ApplicationWindow {
                         }
 
                         Button {
-                            text: "✓ Finalize"
+                            text: bridge.isFlashStationActive ? "✓ Commit Flash" : "✓ Finalize"
                             visible: bridge.isTerrestrialStationActive
                             implicitHeight: 26
-                            implicitWidth: 74
+                            implicitWidth: bridge.isFlashStationActive ? 98 : 74
                             onClicked: bridge.finalizeAndSaveTerrestrialStation()
                             contentItem: Text {
                                 text: parent.text
@@ -10735,7 +10731,6 @@ ApplicationWindow {
         focus: true
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
-        property bool pendingFlashMode: false
         property bool pendingStartImmediately: false
 
         background: Rectangle {
@@ -10755,9 +10750,7 @@ ApplicationWindow {
                 spacing: 10
 
                 Text {
-                    text: motorConfirmDialog.pendingFlashMode
-                        ? "⚡ Hybrid Flash 60° Station — Turntable / Head Confirmation"
-                        : "📡 Terrestrial 360° Station — Turntable / Head Confirmation"
+                    text: "📡 Terrestrial 360° Station — Turntable / Head Confirmation"
                     color: root.avGoldBright
                     font.pixelSize: 15
                     font.bold: true
@@ -10788,7 +10781,7 @@ ApplicationWindow {
                 wrapMode: Text.WordWrap
                 color: root.avWhiteWarm
                 font.pixelSize: 12
-                text: "Verify your tripod rotation mount before starting 6-stop 360° acquisition (60° nominal increments: 0°, 60°, 120°, 180°, 240°, 300° with 5.0s stationary accumulation per stop and 1.0s IMU stillness gate)."
+                text: "Verify your tripod rotation mount before starting standalone Terrestrial 6-stop 360° acquisition (60° increments: 0°, 60°, 120°, 180°, 240°, 300° with 5.0s stationary accumulation per stop). Note: Flash Scan during Mobile SLAM never requires a tripod or motor."
             }
 
             Rectangle {
@@ -10830,11 +10823,7 @@ ApplicationWindow {
                     bridge.confirmMotorAttached(false, "Manual Tripod Head / 60° Detent Turntable");
                     motorConfirmDialog.close();
                     if (motorConfirmDialog.pendingStartImmediately) {
-                        if (motorConfirmDialog.pendingFlashMode) {
-                            bridge.triggerFlashStation60("");
-                        } else {
-                            bridge.startTerrestrialStation("", "", 60.0, false);
-                        }
+                        bridge.startTerrestrialStation("", "", 60.0, false);
                     }
                 }
                 contentItem: Text {
@@ -10863,11 +10852,7 @@ ApplicationWindow {
                     bridge.confirmMotorAttached(true, "Syrp Genie Mini II / ZEAPON Motorized Head");
                     motorConfirmDialog.close();
                     if (motorConfirmDialog.pendingStartImmediately) {
-                        if (motorConfirmDialog.pendingFlashMode) {
-                            bridge.triggerFlashStation60("");
-                        } else {
-                            bridge.startTerrestrialStation("", "", 60.0, false);
-                        }
+                        bridge.startTerrestrialStation("", "", 60.0, false);
                     }
                 }
                 contentItem: Text {

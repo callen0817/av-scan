@@ -624,6 +624,105 @@ bool testRotationControllersAndCableSafety() {
     return true;
 }
 
+// 7. Test Single-Shot Motor-Free Flash Scan (Decoupled from 6x60 deg Terrestrial Mode)
+bool testSingleShotMotorFreeFlashScan() {
+    std::cout << "[RUN ] testSingleShotMotorFreeFlashScan\n";
+
+    class SpyRotationController : public IRotationController {
+    public:
+        int set_zero_calls{0};
+        int move_calls{0};
+        int stop_calls{0};
+        bool connect() override { return true; }
+        void disconnect() override {}
+        bool isConnected() const override { return true; }
+        MotorCapabilities getCapabilities() const override { return MotorCapabilities{}; }
+        RotationMode getRotationMode() const override { return RotationMode::MANUAL_INDEX; }
+        bool setZeroPosition() override { ++set_zero_calls; return true; }
+        bool moveToAngleDeg(double) override { ++move_calls; return true; }
+        bool moveRelativeDeg(double) override { ++move_calls; return true; }
+        bool getCurrentAngleDeg(double& deg) const override { deg = 0.0; return false; }
+        MotionState getMotionState() const override { return MotionState::STATIONARY; }
+        void setOperatorPromptCallback(PromptOperatorCallback) override {}
+        void stopMotion() override { ++stop_calls; }
+    };
+
+    const fs::path temp_root = fs::temp_directory_path() / "av_scan_test_single_shot_flash";
+    fs::remove_all(temp_root);
+
+    auto spy = std::make_shared<SpyRotationController>();
+    TerrestrialStationConfig cfg;
+    cfg.project_id = "proj_flash";
+    cfg.station_id = "flash_st_001";
+    cfg.station_name = "Flash Scan 01";
+    cfg.is_single_shot_flash = true;
+    cfg.T_body_lidar = math::SE3d(math::SO3d(math::Quatd::FromEuler(0.0, 0.0, 90.0 * math::kDegToRad)),
+                                  math::Vec3d(0.10, -0.05, 0.20));
+    cfg.settling_delay_sec = 0.5;
+    cfg.accumulation_sec_per_stop = 2.0;
+
+    TerrestrialStationManager mgr(cfg, spy);
+    EXPECT_TRUE(mgr.startNewStation(temp_root.string(), cfg, DeviceMountProfile::makeAiryProfile()),
+                "startNewStation succeeded for single-shot Flash Scan");
+    EXPECT_TRUE(spy->set_zero_calls == 0, "Single-shot Flash Scan must NEVER reset motor/turntable");
+
+    // Feed stillness + 2.1s of stationary LiDAR frames
+    double t = 10.0;
+    for (int i = 0; i < 30; ++i) {
+        ImuMeasurement imu;
+        imu.timestamp_sec = t;
+        imu.gyro_rads = math::Vec3d(0.001, -0.001, 0.0);
+        imu.accel_mps2 = math::Vec3d(0.0, 0.0, 9.81);
+        mgr.pushImuMeasurement(imu);
+
+        LidarFrame frame;
+        frame.timestamp_start_sec = t;
+        frame.timestamp_end_sec = t + 0.1;
+        LidarPointXYZIRT pt;
+        pt.x = 2.0f; pt.y = 0.0f; pt.z = 0.5f;
+        frame.points.push_back(pt);
+        mgr.pushLidarFrame(frame);
+        t += 0.1;
+        if (mgr.getCaptureState() == TerrestrialCaptureState::STATION_COMPLETED) break;
+    }
+
+    EXPECT_TRUE(mgr.getCaptureState() == TerrestrialCaptureState::STATION_COMPLETED,
+                "Single-shot Flash Scan reaches STATION_COMPLETED directly after 1 stop");
+    EXPECT_TRUE(spy->move_calls == 0 && spy->set_zero_calls == 0,
+                "Single-shot Flash Scan makes zero motor commands");
+
+    std::string err;
+    EXPECT_TRUE(mgr.finalizeAndSaveStation(err), "finalizeAndSaveStation succeeded for Flash Scan");
+    EXPECT_TRUE(spy->set_zero_calls == 0, "finalizeAndSaveStation must NEVER unwind/command motor for Flash Scan");
+
+    const auto meta = mgr.getStationMetadata();
+    EXPECT_TRUE(meta.mode == "flash_scan", "Flash Scan metadata mode is flash_scan");
+    EXPECT_TRUE(meta.expected_stops == 1 && meta.total_stops == 1, "Flash Scan has exactly 1 stop");
+
+    const auto cloud = mgr.buildStationPointCloud();
+    EXPECT_TRUE(!cloud.empty(), "Flash Scan cloud non-empty");
+    // (2,0,0.5) rotated +90 deg around Z -> (0, 2, 0.5) + (0.10, -0.05, 0.20) = (0.10, 1.95, 0.70)
+    EXPECT_NEAR(cloud.front().x, 0.10, 1e-4, "Flash point transformed directly by T_body_lidar X");
+    EXPECT_NEAR(cloud.front().y, 1.95, 1e-4, "Flash point transformed directly by T_body_lidar Y");
+    EXPECT_NEAR(cloud.front().z, 0.70, 1e-4, "Flash point transformed directly by T_body_lidar Z");
+
+    {
+        std::ifstream mf(temp_root / "stations" / "flash_st_001" / "station_manifest.json");
+        std::stringstream ss;
+        ss << mf.rdbuf();
+        const std::string json_str = ss.str();
+        EXPECT_TRUE(json_str.find("\"mode\": \"flash_scan\"") != std::string::npos,
+                    "Manifest records mode=flash_scan");
+        EXPECT_TRUE(json_str.find("\"mode\": \"none_stationary\"") != std::string::npos,
+                    "Manifest records rotation_spec.mode=none_stationary");
+    }
+
+    fs::remove_all(temp_root);
+    std::cout << "[PASS] testSingleShotMotorFreeFlashScan\n";
+    ++g_tests_passed;
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -636,6 +735,7 @@ int main() {
     testFullSixStopStationRefinementAndExports();
     testAutoIncrementStationIdsAndRepeatRgbReset();
     testRotationControllersAndCableSafety();
+    testSingleShotMotorFreeFlashScan();
 
     std::cout << "-----------------------------------------------------------------\n";
     std::cout << " Passed: " << g_tests_passed << " | Failed: " << g_tests_failed << "\n";

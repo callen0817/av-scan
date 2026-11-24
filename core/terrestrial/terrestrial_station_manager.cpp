@@ -247,6 +247,10 @@ TripodAxisCalibration TerrestrialStationManager::getTripodAxisCalibration() cons
 }
 
 math::SE3d TerrestrialStationManager::computeStopTransformLocked(double angle_deg) const {
+    if (config_.is_single_shot_flash) {
+        // Single-shot Flash Scan: stationary capture directly in the active SLAM body frame (no tripod rotation)
+        return config_.T_body_lidar;
+    }
     return RotationGeometry::computeStationLidarTransform(
         angle_deg,
         mount_profile_.T_cam_lidar,
@@ -261,6 +265,15 @@ bool TerrestrialStationManager::startNewStation(
     std::lock_guard<std::mutex> lock(mutex_);
     project_dir_ = project_dir;
     config_ = config;
+    if (config_.is_single_shot_flash) {
+        // Single-shot Flash Scan strictly uses 1 stationary stop with zero motor/turntable rotation
+        config_.total_expected_stops = 1;
+        config_.nominal_step_deg = 0.0;
+        config_.enable_overlap_refinement = false;
+        if (config_.mode.empty() || config_.mode == "terrestrial" || config_.mode == "flash_station") {
+            config_.mode = "flash_scan";
+        }
+    }
     mount_profile_ = mount_profile;
     current_stop_idx_ = 0;
     current_nominal_angle_deg_ = 0.0;
@@ -289,7 +302,9 @@ bool TerrestrialStationManager::startNewStation(
     fs::create_directories(fs::path(station_dir_) / "floors", ec);
 
     state_ = TerrestrialCaptureState::WAITING_FOR_STILLNESS;
-    rotation_ctrl_->setZeroPosition();
+    if (!config_.is_single_shot_flash && rotation_ctrl_) {
+        rotation_ctrl_->setZeroPosition();
+    }
     return true;
 }
 
@@ -424,14 +439,19 @@ bool TerrestrialStationManager::finishCurrentStopLocked() {
     obs.stop_index = current_stop_idx_;
     obs.nominal_angle_deg = current_nominal_angle_deg_;
 
-    double measured_deg = current_nominal_angle_deg_;
-    obs.has_measured_angle = rotation_ctrl_->getCurrentAngleDeg(measured_deg);
-    obs.measured_angle_deg = measured_deg;
+    if (config_.is_single_shot_flash) {
+        obs.has_measured_angle = false;
+        obs.measured_angle_deg = 0.0;
+    } else {
+        double measured_deg = current_nominal_angle_deg_;
+        obs.has_measured_angle = rotation_ctrl_->getCurrentAngleDeg(measured_deg);
+        obs.measured_angle_deg = measured_deg;
+    }
 
     obs.timestamp_start_sec = stop_start_time_sec_;
     obs.timestamp_end_sec = latest_frame_end_sec_;
 
-    // Transform from LiDAR sensor frame to Station frame
+    // Transform from LiDAR sensor frame to Station frame (or body frame for single-shot Flash Scan)
     obs.T_station_lidar = computeStopTransformLocked(obs.measured_angle_deg);
     obs.stationary_points = current_stop_points_;
 
@@ -473,7 +493,9 @@ bool TerrestrialStationManager::finishCurrentStopLocked() {
     stops_.push_back(std::move(obs));
     current_stop_points_.clear();
     current_stop_rgb_pixels_.clear();
-    state_ = TerrestrialCaptureState::STOP_COMPLETED;
+    state_ = config_.is_single_shot_flash
+        ? TerrestrialCaptureState::STATION_COMPLETED
+        : TerrestrialCaptureState::STOP_COMPLETED;
     return true;
 }
 
@@ -484,7 +506,7 @@ bool TerrestrialStationManager::advanceToNextStop() {
         finishCurrentStopLocked();
     }
 
-    if (current_stop_idx_ + 1 >= config_.total_expected_stops) {
+    if (config_.is_single_shot_flash || current_stop_idx_ + 1 >= config_.total_expected_stops) {
         state_ = TerrestrialCaptureState::STATION_COMPLETED;
         return true;
     }
@@ -529,7 +551,9 @@ bool TerrestrialStationManager::repeatCurrentStop() {
 
 bool TerrestrialStationManager::cancelStation() {
     std::lock_guard<std::mutex> lock(mutex_);
-    rotation_ctrl_->stopMotion();
+    if (!config_.is_single_shot_flash && rotation_ctrl_) {
+        rotation_ctrl_->stopMotion();
+    }
     state_ = TerrestrialCaptureState::IDLE;
     stops_.clear();
     current_stop_points_.clear();
@@ -922,7 +946,9 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
     computeCoverageMetrics(az_cov, el_cov, cov_warn);
 
     std::string rot_mode_str = "manual";
-    if (config_.rotation_mode == RotationMode::AUTOMATIC_MOTOR) {
+    if (config_.is_single_shot_flash) {
+        rot_mode_str = "none_stationary";
+    } else if (config_.rotation_mode == RotationMode::AUTOMATIC_MOTOR) {
         rot_mode_str = "automatic";
     } else if (config_.rotation_mode == RotationMode::PRESET_INTERVAL) {
         rot_mode_str = "preset";
@@ -938,7 +964,7 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
     json << "  \"project_id\": \"" << config_.project_id << "\",\n";
     json << "  \"station_id\": \"" << config_.station_id << "\",\n";
     json << "  \"name\": \"" << config_.station_name << "\",\n";
-    json << "  \"mode\": \"" << (config_.mode.empty() ? "terrestrial" : config_.mode) << "\",\n";
+    json << "  \"mode\": \"" << (config_.mode.empty() ? (config_.is_single_shot_flash ? "flash_scan" : "terrestrial") : config_.mode) << "\",\n";
     json << "  \"created_utc\": \"" << now_utc << "\",\n";
     json << "  \"hardware_profile\": {\n";
     json << "    \"app\": \"" << (mount_profile_.host_app.empty() ? "AV Scan" : mount_profile_.host_app) << "\",\n";
@@ -963,11 +989,14 @@ bool TerrestrialStationManager::writeStationArtifactsLocked(std::string& out_err
     json << "  \"stops\": [\n";
     for (size_t i = 0; i < stops_.size(); ++i) {
         const auto& s = stops_[i];
+        const char* angle_src = config_.is_single_shot_flash
+            ? "stationary_pose"
+            : (s.has_measured_angle ? "encoder" : "overlap_refined");
         json << "    {\n";
         json << "      \"index\": " << s.stop_index << ",\n";
         json << "      \"nominal_angle_deg\": " << s.nominal_angle_deg << ",\n";
         json << "      \"refined_angle_deg\": " << s.measured_angle_deg << ",\n";
-        json << "      \"angle_source\": \"" << (s.has_measured_angle ? "encoder" : "overlap_refined") << "\",\n";
+        json << "      \"angle_source\": \"" << angle_src << "\",\n";
         json << "      \"timestamp_start_sec\": " << s.timestamp_start_sec << ",\n";
         json << "      \"timestamp_end_sec\": " << s.timestamp_end_sec << ",\n";
         json << "      \"lidar_points_captured\": " << s.stationary_points.size() << ",\n";
@@ -1018,7 +1047,7 @@ bool TerrestrialStationManager::finalizeAndSaveStation(std::string& out_error) {
     }
 
     // Refine stop orientations via constrained 1-DOF overlap alignment around tripod Z axis
-    if (config_.enable_overlap_refinement && stops_.size() >= 2) {
+    if (!config_.is_single_shot_flash && config_.enable_overlap_refinement && stops_.size() >= 2) {
         refineStopAnglesViaOverlap(refined_overall_rmse_m_);
     }
 
@@ -1028,8 +1057,10 @@ bool TerrestrialStationManager::finalizeAndSaveStation(std::string& out_error) {
         return false;
     }
 
-    // Return motor to starting zero position safely (unwinds cable)
-    rotation_ctrl_->setZeroPosition();
+    // Return motor to starting zero position safely (unwinds cable) — strictly for multi-stop Terrestrial Mode
+    if (!config_.is_single_shot_flash && rotation_ctrl_) {
+        rotation_ctrl_->setZeroPosition();
+    }
     state_ = TerrestrialCaptureState::STATION_COMPLETED;
     return true;
 }
